@@ -153,8 +153,9 @@ TOOL_SPECS = [
     {
         "name": "play_music",
         "description": (
-            "Play a song, artist, or playlist in the user's voice channel. "
-            "Use whenever the user wants to listen to, put on, or play music."
+            "Play NOW: replace the whole queue with this song/playlist and start "
+            "it immediately. Use when the user says 'play …'. For adding without "
+            "interrupting, use add_to_queue instead."
         ),
         "properties": {
             "query": ("string", "What to search for: song, artist, playlist, or link."),
@@ -165,6 +166,27 @@ TOOL_SPECS = [
             ),
         },
         "required": ["query"],
+    },
+    {
+        "name": "add_to_queue",
+        "description": (
+            "Add a song/playlist to the END of the queue without interrupting the "
+            "current song. Use for 'add …', 'queue …', 'play next', 'also play …'."
+        ),
+        "properties": {
+            "query": ("string", "What to search for: song, artist, playlist, or link."),
+            "start_seconds": (
+                "integer",
+                "Where to start this track, in seconds. Use 0 for the beginning.",
+            ),
+        },
+        "required": ["query"],
+    },
+    {
+        "name": "clear_queue",
+        "description": "Remove all upcoming songs from the queue (the current song keeps playing).",
+        "properties": {},
+        "required": [],
     },
     {
         "name": "stop_music",
@@ -290,6 +312,11 @@ async def run_tool(message: discord.Message, name: str, args: dict):
     if name == "play_music":
         start = int(args.get("start_seconds") or 0)
         await play_music(message, args.get("query", ""), start)
+    elif name == "add_to_queue":
+        start = int(args.get("start_seconds") or 0)
+        await add_music(message, args.get("query", ""), start)
+    elif name == "clear_queue":
+        await clear_queue(message)
     elif name == "stop_music":
         await leave_voice(message)
     elif name == "skip_song":
@@ -493,86 +520,114 @@ def youtube_playlist_entries(url: str) -> list:
     return out
 
 
-async def play_music(message: discord.Message, query: str, start_seconds: int = 0):
-    # You must be in a voice channel so the bot knows where to join.
+async def ensure_voice(message: discord.Message):
+    # Make sure the user is in a voice channel and the bot is connected to it.
+    # Returns the voice client, or None (after messaging) if we can't join.
     if not message.author.voice or not message.author.voice.channel:
         await message.channel.send("Join a voice channel first, then try again.")
-        return
+        return None
     channel = message.author.voice.channel
-
-    # Connect to your channel (or move there if already connected elsewhere).
     voice = message.guild.voice_client
     if voice is None:
         voice = await channel.connect()
     elif voice.channel != channel:
         await voice.move_to(channel)
+    return voice
 
+
+async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
+                  announce_add: bool = False) -> int:
+    # APPEND the song(s) for `query` to the queue WITHOUT starting playback.
+    # Handles Spotify links, YouTube/Music playlists, and single songs/searches.
+    # Returns how many tracks were added (0 means nothing was, or an error).
     queue = get_player(message.guild.id).queue
-    was_idle = not (voice.is_playing() or voice.is_paused())
 
     if is_spotify_url(query):
-        # Spotify link -> expand into many YouTube searches and queue them all.
         if spotify_client is None:
             await message.channel.send(
                 "Spotify playlists need a one-time login. Set SPOTIFY_CLIENT_ID/"
                 "SECRET in .env, run `python spotify_login.py` once, then restart me."
             )
-            return
+            return 0
         async with message.channel.typing():
             try:
                 searches = await asyncio.to_thread(spotify_tracks, query)
             except Exception as error:
                 await message.channel.send(f"Couldn't read that Spotify link: {error}")
-                return
+                return 0
         if not searches:
             await message.channel.send("That Spotify link had no playable tracks.")
-            return
+            return 0
         for search in searches:
-            queue.append({
-                "query": search,
-                "title": search,
-                "start_seconds": 0,
-                "channel": message.channel,
-            })
-        await message.channel.send(
-            f"➕ Queued **{len(searches)}** tracks from Spotify."
-        )
-    elif is_youtube_playlist(query):
-        # A YouTube / YouTube Music playlist link -> enumerate all its videos.
+            queue.append({"query": search, "title": search,
+                          "start_seconds": 0, "channel": message.channel})
+        await message.channel.send(f"➕ Queued **{len(searches)}** tracks from Spotify.")
+        return len(searches)
+
+    if is_youtube_playlist(query):
         async with message.channel.typing():
             try:
                 entries = await asyncio.to_thread(youtube_playlist_entries, query)
             except Exception as error:
                 await message.channel.send(f"Couldn't read that playlist: {error}")
-                return
+                return 0
         if not entries:
             await message.channel.send("That playlist had no playable videos.")
-            return
+            return 0
         for entry in entries:
-            queue.append({
-                "query": entry["query"],
-                "title": entry["title"],
-                "start_seconds": 0,
-                "channel": message.channel,
-            })
+            queue.append({"query": entry["query"], "title": entry["title"],
+                          "start_seconds": 0, "channel": message.channel})
         await message.channel.send(f"➕ Queued **{len(entries)}** tracks from YouTube.")
-    else:
-        # A single song name or link (YouTube, YouTube Music, or plain text). We
-        # store it UNRESOLVED and look it up when it's this track's turn to play.
-        queue.append({
-            "query": query,
-            "title": query,
-            "start_seconds": start_seconds,
-            "channel": message.channel,
-        })
-        if not was_idle:
-            await message.channel.send(
-                f"➕ Added to queue (#{len(queue)}): **{query}**"
-            )
+        return len(entries)
 
-    # If nothing was playing, start now; otherwise tracks wait their turn.
-    if was_idle:
+    # A single song name or link. Stored unresolved; looked up when it plays.
+    queue.append({"query": query, "title": query,
+                  "start_seconds": start_seconds, "channel": message.channel})
+    if announce_add:
+        await message.channel.send(f"➕ Added to queue (#{len(queue)}): **{query}**")
+    return 1
+
+
+async def play_music(message: discord.Message, query: str, start_seconds: int = 0):
+    # "Play now": REPLACE the queue with this song/playlist and start it fresh.
+    voice = await ensure_voice(message)
+    if voice is None:
+        return
+    player = get_player(message.guild.id)
+    saved = player.queue[:]  # snapshot, so a failed lookup doesn't wipe the queue
+    player.queue.clear()
+    if await enqueue(message, query, start_seconds) == 0:
+        player.queue[:] = saved  # restore on failure
+        return
+    # Start fresh: stopping the current song fires its after-callback, which plays
+    # the new queue front; if nothing was playing, just begin.
+    if voice.is_playing() or voice.is_paused():
+        voice.stop()
+    else:
         await play_next(message.guild)
+
+
+async def add_music(message: discord.Message, query: str, start_seconds: int = 0):
+    # "Add": append to the queue without disturbing the current song.
+    voice = await ensure_voice(message)
+    if voice is None:
+        return
+    was_idle = not (voice.is_playing() or voice.is_paused())
+    if await enqueue(message, query, start_seconds, announce_add=not was_idle) == 0:
+        return
+    if was_idle:  # nothing playing -> start the track we just added
+        await play_next(message.guild)
+
+
+async def clear_queue(message: discord.Message):
+    # Empty the upcoming queue but leave the current song playing.
+    player = get_player(message.guild.id)
+    count = len(player.queue)
+    if count == 0:
+        await message.channel.send("The queue is already empty.")
+        return
+    player.queue.clear()
+    await message.channel.send(f"🗑️ Cleared {count} song(s) from the queue.")
 
 
 async def skip_song(message: discord.Message):
@@ -605,15 +660,31 @@ async def play_previous(message: discord.Message):
 
 
 async def shuffle_queue(message: discord.Message, query: str = ""):
-    # Optional: "syntia shuffle <song/playlist>" plays it first, then shuffles.
     if query:
-        await play_music(message, query)
+        # Shuffle-play: REPLACE the queue, shuffle it, THEN start — so the first
+        # track is random, not the playlist's original opener.
+        voice = await ensure_voice(message)
+        if voice is None:
+            return
+        player = get_player(message.guild.id)
+        saved = player.queue[:]
+        player.queue.clear()
+        if await enqueue(message, query) == 0:
+            player.queue[:] = saved
+            return
+        if len(player.queue) >= 2:
+            random.shuffle(player.queue)
+            await message.channel.send("🔀 Shuffled the queue.")
+        if voice.is_playing() or voice.is_paused():
+            voice.stop()  # after-callback plays the new (random) front
+        else:
+            await play_next(message.guild)
+        return
+
+    # No query: just shuffle whatever is already queued.
     queue = get_player(message.guild.id).queue
     if len(queue) < 2:
-        # Only complain if the user just wanted to shuffle an existing queue;
-        # if they gave a query, play_music already replied.
-        if not query:
-            await message.channel.send("Not enough songs in the queue to shuffle.")
+        await message.channel.send("Not enough songs in the queue to shuffle.")
         return
     random.shuffle(queue)  # shuffles the list in place
     await message.channel.send("🔀 Shuffled the queue.")
@@ -680,7 +751,7 @@ async def on_message(message: discord.Message):
             await message.channel.send(f"🎲 You rolled a **{result}** (1–{sides}).")
 
         case "play":
-            # Everything after "play" is the song name or YouTube link.
+            # "play" REPLACES the queue and starts now (song or playlist).
             query = " ".join(args)
             if not query:
                 await message.channel.send(
@@ -688,6 +759,19 @@ async def on_message(message: discord.Message):
                 )
             else:
                 await play_music(message, query)
+
+        case "add" | "enqueue":
+            # "add" APPENDS to the queue without interrupting the current song.
+            query = " ".join(args)
+            if not query:
+                await message.channel.send(
+                    "Give me a song or link to add, e.g. `syntia add some jazz`."
+                )
+            else:
+                await add_music(message, query)
+
+        case "clear":
+            await clear_queue(message)
 
         case "stop" | "leave" | "bye":
             # One case can match several words with the | (or) pattern.
