@@ -1,0 +1,10 @@
+# Secrets — never commit
+.env
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local-only helper (one-time cleanup script, kept for reference)
+clear_global.py
