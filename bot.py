@@ -295,7 +295,9 @@ async def run_tool(message: discord.Message, name: str, args: dict):
     elif name == "skip_song":
         await skip_song(message)
     elif name == "shuffle_queue":
-        await shuffle_queue(message, args)
+        # The AI shuffles the existing queue; for "play X then shuffle" it just
+        # emits two tool calls (play_music + shuffle_queue), handled by ask_ai.
+        await shuffle_queue(message)
     elif name == "play_previous":
         await play_previous(message)
 
@@ -602,19 +604,16 @@ async def play_previous(message: discord.Message):
         await play_next(message.guild)
 
 
-async def shuffle_queue(message: discord.Message, args, call_play=True):
+async def shuffle_queue(message: discord.Message, query: str = ""):
+    # Optional: "syntia shuffle <song/playlist>" plays it first, then shuffles.
+    if query:
+        await play_music(message, query)
     queue = get_player(message.guild.id).queue
-    if call_play and len(queue) == 0:
-        query = " ".join(args)
+    if len(queue) < 2:
+        # Only complain if the user just wanted to shuffle an existing queue;
+        # if they gave a query, play_music already replied.
         if not query:
-            await message.channel.send(
-                "Give me a song or link, e.g. `syntia play lofi hip hop`."
-            )
-        else:
-            await play_music(message, query)
-            await shuffle_queue(message, args, False)
-    elif len(queue) < 2:
-        await message.channel.send("Not enough songs in the queue to shuffle.")
+            await message.channel.send("Not enough songs in the queue to shuffle.")
         return
     random.shuffle(queue)  # shuffles the list in place
     await message.channel.send("🔀 Shuffled the queue.")
@@ -698,7 +697,7 @@ async def on_message(message: discord.Message):
             await skip_song(message)
 
         case "shuffle":
-            await shuffle_queue(message, args)
+            await shuffle_queue(message, " ".join(args))
 
         case "queue":
             await show_queue(message)
