@@ -1,5 +1,7 @@
 # Secrets — never commit
 .env
+.spotify_cache
+.cache
 
 # Python virtual environment
 .venv/

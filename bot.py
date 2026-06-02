@@ -8,15 +8,18 @@ Run it with:  .venv\Scripts\python.exe bot.py
 import asyncio
 import os
 import random
+import re
 from pathlib import Path
 
 import discord
 import ollama
+import spotipy
 import yt_dlp
 from discord import app_commands
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from spotipy.oauth2 import SpotifyOAuth
 
 # Load the secret token from the .env file into the environment.
 # We keep the token OUT of the code so it never gets committed to git.
@@ -40,6 +43,33 @@ GEMINI_MODEL = "gemini-2.5-flash"  # fast and free-tier friendly
 # Ollama (local, http://localhost:11434). Use a tool-capable model (qwen2.5 is).
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M")
 ollama_client = ollama.AsyncClient()
+
+# Spotify: we read a playlist/album/track's song list, then find the audio on
+# YouTube (Spotify itself can't be streamed). Reading PLAYLISTS now requires a
+# user login, so you log in ONCE with `python spotify_login.py` — that caches a
+# token to .spotify_cache, which the bot reads and refreshes automatically.
+# Free credentials: https://developer.spotify.com/dashboard
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_REDIRECT_URI = os.getenv(
+    "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"
+)
+SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
+SPOTIFY_CACHE = str(Path(__file__).parent / ".spotify_cache")
+
+spotify_client = None
+if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+    spotify_auth = SpotifyOAuth(
+        client_id=SPOTIFY_CLIENT_ID,
+        client_secret=SPOTIFY_CLIENT_SECRET,
+        redirect_uri=SPOTIFY_REDIRECT_URI,
+        scope=SPOTIFY_SCOPE,
+        cache_path=SPOTIFY_CACHE,
+        open_browser=False,  # the bot must NEVER block trying to open a browser
+    )
+    # Only enable Spotify if a login is already cached (from spotify_login.py).
+    if spotify_auth.cache_handler.get_cached_token():
+        spotify_client = spotipy.Spotify(auth_manager=spotify_auth)
 
 # The bot's "system prompt" (personality + rules) lives in System_Prompt.md so
 # you can edit the personality in plain Markdown without touching code.
@@ -154,6 +184,12 @@ TOOL_SPECS = [
         "properties": {},
         "required": [],
     },
+    {
+        "name": "play_previous",
+        "description": "Go back and replay the previously played song, keeping the rest of the queue intact.",
+        "properties": {},
+        "required": [],
+    },
 ]
 
 _GEMINI_TYPES = {"string": types.Type.STRING, "integer": types.Type.INTEGER}
@@ -185,20 +221,18 @@ def _build_ollama_tools():
             name: {"type": kind, "description": desc}
             for name, (kind, desc) in spec["properties"].items()
         }
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": spec["name"],
-                    "description": spec["description"],
-                    "parameters": {
-                        "type": "object",
-                        "properties": props,
-                        "required": spec["required"],
-                    },
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": spec["name"],
+                "description": spec["description"],
+                "parameters": {
+                    "type": "object",
+                    "properties": props,
+                    "required": spec["required"],
                 },
-            }
-        )
+            },
+        })
     return tools
 
 
@@ -251,7 +285,9 @@ async def run_tool(message: discord.Message, name: str, args: dict):
     elif name == "skip_song":
         await skip_song(message)
     elif name == "shuffle_queue":
-        await shuffle_queue(message)
+        await shuffle_queue(message, args)
+    elif name == "play_previous":
+        await play_previous(message)
 
 
 async def ask_ai(message: discord.Message, prompt: str):
@@ -297,6 +333,10 @@ YTDL_OPTS = {
 }
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
+# A second extractor in "flat" mode: lists a playlist's videos quickly WITHOUT
+# resolving each one (we resolve lazily at play time, like the Spotify tracks).
+ytdl_flat = yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True, "no_warnings": True})
+
 
 # FFmpeg flags: -vn drops video; reconnect flags help if the stream hiccups.
 # -ss <seconds> (input seek) is how we START PART-WAY into a track. A YouTube
@@ -308,26 +348,31 @@ def ffmpeg_options(start_seconds: int = 0) -> dict:
     return {"before_options": before, "options": "-vn"}
 
 
-# Each server gets its own list of upcoming tracks. Key = guild id, value = list.
-song_queues: dict[int, list[dict]] = {}
+# Each server gets its own player: what's playing now, what's queued, and what
+# has already played (so we can go back to a previous song).
+class GuildPlayer:
+    def __init__(self):
+        self.queue = []  # upcoming tracks (front of the list = next to play)
+        self.history = []  # tracks already played (oldest first)
+        self.current = None  # the track playing right now
 
 
-def get_queue(guild_id: int) -> list:
-    # setdefault: return the existing queue, or create an empty one on first use.
-    return song_queues.setdefault(guild_id, [])
+players: dict[int, GuildPlayer] = {}
 
 
-async def resolve_track(query: str, start_seconds: int, text_channel) -> dict:
-    # Ask yt-dlp for the audio. Blocking work, so run it off the event loop.
+def get_player(guild_id: int) -> GuildPlayer:
+    # setdefault: return the existing player, or create one on first use.
+    return players.setdefault(guild_id, GuildPlayer())
+
+
+async def resolve_stream(query: str):
+    # Ask yt-dlp for a playable audio stream. Blocking, so run it in a thread.
+    # Returns (stream_url, real_title). We resolve LAZILY — only when a track is
+    # about to play — so adding a 50-song Spotify playlist is instant.
     data = await asyncio.to_thread(ytdl.extract_info, query, download=False)
     if "entries" in data:  # a search returns a list of hits; take the first
         data = data["entries"][0]
-    return {
-        "title": data.get("title", "Unknown"),
-        "stream_url": data["url"],
-        "start_seconds": start_seconds,
-        "channel": text_channel,  # where to announce "Now playing"
-    }
+    return data["url"], data.get("title", query)
 
 
 def schedule_next(guild: discord.Guild):
@@ -337,19 +382,101 @@ def schedule_next(guild: discord.Guild):
 
 
 async def play_next(guild: discord.Guild):
-    queue = get_queue(guild.id)
+    player = get_player(guild.id)
     voice = guild.voice_client
-    if voice is None or not queue:
-        return  # not connected, or nothing left to play
-    track = queue.pop(0)  # take the song at the front of the line
-    source = await discord.FFmpegOpusAudio.from_probe(
-        track["stream_url"], **ffmpeg_options(track["start_seconds"])
-    )
-    # after=... runs when THIS song finishes -> kick off the next one.
-    voice.play(source, after=lambda error: schedule_next(guild))
-    start = track["start_seconds"]
-    note = f" (from {start // 60}:{start % 60:02d})" if start else ""
-    await track["channel"].send(f"▶️ Now playing: **{track['title']}**{note}")
+    if voice is None:
+        return
+    # The song that just finished (if any) moves into history so we can go back.
+    if player.current is not None:
+        player.history.append(player.current)
+        player.current = None
+    # Loop so a track we can't load just gets skipped instead of stopping music.
+    while player.queue:
+        entry = player.queue.pop(0)  # take the song at the front of the line
+        try:
+            stream_url, title = await resolve_stream(entry["query"])
+        except Exception as error:
+            await entry["channel"].send(
+                f"Skipping **{entry['title']}** (couldn't load it: {error})."
+            )
+            continue
+        entry["title"] = title  # remember the real YouTube title for later display
+        player.current = entry
+        source = await discord.FFmpegOpusAudio.from_probe(
+            stream_url, **ffmpeg_options(entry["start_seconds"])
+        )
+        # after=... runs when THIS song finishes -> kick off the next one.
+        voice.play(source, after=lambda error: schedule_next(guild))
+        start = entry["start_seconds"]
+        note = f" (from {start // 60}:{start % 60:02d})" if start else ""
+        await entry["channel"].send(f"▶️ Now playing: **{title}**{note}")
+        return
+
+
+def _spotify_query(track: dict) -> str:
+    # Turn a Spotify track into a YouTube search string, e.g. "Queen - Bohemian Rhapsody".
+    if not track:
+        return ""
+    name = track.get("name", "")
+    artists = ", ".join(artist["name"] for artist in track.get("artists", []))
+    return f"{artists} - {name}".strip(" -")
+
+
+def spotify_tracks(url: str) -> list:
+    # Read a Spotify track / playlist / album link and return YouTube search
+    # strings. Blocking (network), so callers run it via asyncio.to_thread.
+    match = re.search(r"open\.spotify\.com/(playlist|track|album)/([A-Za-z0-9]+)", url)
+    if not match:
+        return []
+    kind, spotify_id = match.group(1), match.group(2)
+    searches = []
+
+    if kind == "track":
+        searches.append(_spotify_query(spotify_client.track(spotify_id)))
+    elif kind == "playlist":
+        page = spotify_client.playlist_items(spotify_id, additional_types=["track"])
+        while page:  # playlists come in pages; follow "next" until there's none
+            for item in page["items"]:
+                # Spotify now nests the track under "item" (older API used "track").
+                searches.append(_spotify_query(item.get("item") or item.get("track")))
+            page = spotify_client.next(page) if page.get("next") else None
+    elif kind == "album":
+        page = spotify_client.album_tracks(spotify_id)
+        while page:
+            for track in page["items"]:
+                searches.append(_spotify_query(track))
+            page = spotify_client.next(page) if page.get("next") else None
+
+    return [search for search in searches if search]  # drop any empties
+
+
+def is_spotify_url(text: str) -> bool:
+    return "open.spotify.com" in text.lower()
+
+
+def is_youtube_playlist(text: str) -> bool:
+    # Only dedicated playlist links expand. A normal watch link (even one that
+    # carries a "&list=...") just plays its single video.
+    low = text.lower()
+    return "youtube.com/playlist" in low or "music.youtube.com/playlist" in low
+
+
+def youtube_playlist_entries(url: str) -> list:
+    # Enumerate a YouTube / YouTube Music playlist's videos. Blocking, so callers
+    # use asyncio.to_thread. Returns [{"query": watch_url, "title": ...}, ...].
+    data = ytdl_flat.extract_info(url, download=False)
+    entries = data.get("entries") or []
+    out = []
+    for entry in entries:
+        if not entry:
+            continue
+        video = entry.get("url") or entry.get("id")
+        if not video:
+            continue
+        if not video.startswith("http"):
+            video = f"https://www.youtube.com/watch?v={video}"
+        out.append({"query": video, "title": entry.get("title") or video})
+    return out
 
 
 async def play_music(message: discord.Message, query: str, start_seconds: int = 0):
@@ -366,23 +493,72 @@ async def play_music(message: discord.Message, query: str, start_seconds: int = 
     elif voice.channel != channel:
         await voice.move_to(channel)
 
-    async with message.channel.typing():
-        try:
-            track = await resolve_track(query, start_seconds, message.channel)
-        except Exception as error:
-            await message.channel.send(f"Couldn't find that: {error}")
+    queue = get_player(message.guild.id).queue
+    was_idle = not (voice.is_playing() or voice.is_paused())
+
+    if is_spotify_url(query):
+        # Spotify link -> expand into many YouTube searches and queue them all.
+        if spotify_client is None:
+            await message.channel.send(
+                "Spotify playlists need a one-time login. Set SPOTIFY_CLIENT_ID/"
+                "SECRET in .env, run `python spotify_login.py` once, then restart me."
+            )
             return
-
-    queue = get_queue(message.guild.id)
-    queue.append(track)
-
-    # If nothing is playing, start now; otherwise the track waits its turn.
-    if not voice.is_playing() and not voice.is_paused():
-        await play_next(message.guild)
-    else:
+        async with message.channel.typing():
+            try:
+                searches = await asyncio.to_thread(spotify_tracks, query)
+            except Exception as error:
+                await message.channel.send(f"Couldn't read that Spotify link: {error}")
+                return
+        if not searches:
+            await message.channel.send("That Spotify link had no playable tracks.")
+            return
+        for search in searches:
+            queue.append({
+                "query": search,
+                "title": search,
+                "start_seconds": 0,
+                "channel": message.channel,
+            })
         await message.channel.send(
-            f"➕ Added to queue (#{len(queue)}): **{track['title']}**"
+            f"➕ Queued **{len(searches)}** tracks from Spotify."
         )
+    elif is_youtube_playlist(query):
+        # A YouTube / YouTube Music playlist link -> enumerate all its videos.
+        async with message.channel.typing():
+            try:
+                entries = await asyncio.to_thread(youtube_playlist_entries, query)
+            except Exception as error:
+                await message.channel.send(f"Couldn't read that playlist: {error}")
+                return
+        if not entries:
+            await message.channel.send("That playlist had no playable videos.")
+            return
+        for entry in entries:
+            queue.append({
+                "query": entry["query"],
+                "title": entry["title"],
+                "start_seconds": 0,
+                "channel": message.channel,
+            })
+        await message.channel.send(f"➕ Queued **{len(entries)}** tracks from YouTube.")
+    else:
+        # A single song name or link (YouTube, YouTube Music, or plain text). We
+        # store it UNRESOLVED and look it up when it's this track's turn to play.
+        queue.append({
+            "query": query,
+            "title": query,
+            "start_seconds": start_seconds,
+            "channel": message.channel,
+        })
+        if not was_idle:
+            await message.channel.send(
+                f"➕ Added to queue (#{len(queue)}): **{query}**"
+            )
+
+    # If nothing was playing, start now; otherwise tracks wait their turn.
+    if was_idle:
+        await play_next(message.guild)
 
 
 async def skip_song(message: discord.Message):
@@ -394,9 +570,38 @@ async def skip_song(message: discord.Message):
         await message.channel.send("Nothing is playing.")
 
 
-async def shuffle_queue(message: discord.Message):
-    queue = get_queue(message.guild.id)
-    if len(queue) < 2:
+async def play_previous(message: discord.Message):
+    player = get_player(message.guild.id)
+    voice = message.guild.voice_client
+    if not player.history:
+        await message.channel.send("No previous song to go back to.")
+        return
+    target = player.history.pop()  # the previously played song we'll replay
+    # The current song should play again AFTER the previous one, so push it back
+    # to the front of the queue. This keeps the rest of the queue untouched.
+    if player.current is not None:
+        player.queue.insert(0, player.current)
+        player.current = None  # cleared so play_next won't archive it again
+    player.queue.insert(0, target)  # target jumps to the very front
+    await message.channel.send("⏮️ Going back a song.")
+    if voice and (voice.is_playing() or voice.is_paused()):
+        voice.stop()  # fires the after= callback -> play_next plays target
+    else:
+        await play_next(message.guild)
+
+
+async def shuffle_queue(message: discord.Message, args, call_play=True):
+    queue = get_player(message.guild.id).queue
+    if call_play and len(queue) == 0:
+        query = " ".join(args)
+        if not query:
+            await message.channel.send(
+                "Give me a song or link, e.g. `syntia play lofi hip hop`."
+            )
+        else:
+            await play_music(message, query)
+            await shuffle_queue(message, args, False)
+    elif len(queue) < 2:
         await message.channel.send("Not enough songs in the queue to shuffle.")
         return
     random.shuffle(queue)  # shuffles the list in place
@@ -404,12 +609,17 @@ async def shuffle_queue(message: discord.Message):
 
 
 async def show_queue(message: discord.Message):
-    queue = get_queue(message.guild.id)
-    if not queue:
-        await message.channel.send("The queue is empty.")
+    player = get_player(message.guild.id)
+    lines = []
+    if player.current:
+        lines.append(f"**Now playing:** {player.current['title']}")
+    if player.queue:
+        lines.append("**Up next:**")
+        lines += [f"{i}. {track['title']}" for i, track in enumerate(player.queue, 1)]
+    if not lines:
+        await message.channel.send("Nothing playing and the queue is empty.")
         return
-    lines = [f"{i}. {track['title']}" for i, track in enumerate(queue, 1)]
-    await message.channel.send(("**Up next:**\n" + "\n".join(lines))[:2000])
+    await message.channel.send("\n".join(lines)[:2000])
 
 
 async def leave_voice(message: discord.Message):
@@ -417,9 +627,9 @@ async def leave_voice(message: discord.Message):
     if voice is None:
         await message.channel.send("I'm not in a voice channel.")
         return
-    get_queue(message.guild.id).clear()  # forget the queue when we leave
+    players.pop(message.guild.id, None)  # forget queue, history, and current
     await voice.disconnect()
-    await message.channel.send("Left the voice channel. 👋")
+    await message.channel.send("If you wanna be Alone then be Alone... Bye!")
 
 
 @client.event
@@ -437,7 +647,7 @@ async def on_message(message: discord.Message):
 
     # Remove the prefix, then split the rest into a command word + its arguments.
     # "syntia roll 20"  ->  command = "roll", args = ["20"]
-    body = message.content[len(PREFIX):].strip()
+    body = message.content[len(PREFIX) :].strip()
     parts = body.split()
     if not parts:
         return
@@ -468,7 +678,7 @@ async def on_message(message: discord.Message):
             else:
                 await play_music(message, query)
 
-        case "stop" | "leave":
+        case "stop" | "leave" | "bye":
             # One case can match several words with the | (or) pattern.
             await leave_voice(message)
 
@@ -476,10 +686,13 @@ async def on_message(message: discord.Message):
             await skip_song(message)
 
         case "shuffle":
-            await shuffle_queue(message)
+            await shuffle_queue(message, args)
 
         case "queue":
             await show_queue(message)
+
+        case "previous" | "prev" | "back":
+            await play_previous(message)
 
         case _:
             # Nothing matched — maybe a typo, maybe they just want to chat.
@@ -489,6 +702,7 @@ async def on_message(message: discord.Message):
 
 # --- Commands -------------------------------------------------------------
 # Each function below is a slash command. The @decorator registers it.
+
 
 @client.tree.command(name="ping", description="Check that the bot is alive.")
 async def ping(interaction: discord.Interaction):
