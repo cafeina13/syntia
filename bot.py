@@ -5,11 +5,14 @@ Read this top-to-bottom; the comments explain each piece.
 Run it with:  .venv\Scripts\python.exe bot.py
 """
 
+import asyncio
 import os
 import random
 from pathlib import Path
 
 import discord
+import ollama
+import yt_dlp
 from discord import app_commands
 from dotenv import load_dotenv
 from google import genai
@@ -25,11 +28,18 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # Leave it unset to publish commands globally (slow, but visible in every server).
 GUILD_ID = os.getenv("GUILD_ID")
 
-# Google AI Studio (Gemini) — free tier. Get a key at https://aistudio.google.com/apikey
-# If the key is missing we just skip AI; the rest of the bot still works.
+# Which AI backend to use: "gemini" (cloud, free tier) or "ollama" (local).
+# Set AI_BACKEND in .env. Ollama is great for offline testing — no rate limits.
+AI_BACKEND = os.getenv("AI_BACKEND", "gemini").lower()
+
+# Gemini (cloud). Free key at https://aistudio.google.com/apikey
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-AI_MODEL = "gemini-2.5-flash"  # fast and free-tier friendly
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+GEMINI_MODEL = "gemini-2.5-flash"  # fast and free-tier friendly
+
+# Ollama (local, http://localhost:11434). Use a tool-capable model (qwen2.5 is).
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M")
+ollama_client = ollama.AsyncClient()
 
 # The bot's "system prompt" (personality + rules) lives in System_Prompt.md so
 # you can edit the personality in plain Markdown without touching code.
@@ -51,7 +61,11 @@ def build_system_instruction(message: discord.Message) -> str:
         f"{AI_PRE_PROMPT}\n\n"
         f"### Current Context\n"
         f"- The user you are talking to is named: {user_name}\n"
-        f"- Server: {server_name}"
+        f"- Server: {server_name}\n\n"
+        f"You can play or stop music in the user's voice channel by calling your "
+        f"available tools whenever they want to listen to or stop something. "
+        f"If a message is clearly a song, artist, or playlist, play it instead of "
+        f"replying with text."
     )
 
 
@@ -101,34 +115,311 @@ async def on_ready():
     print("Bot is ready! Try /ping, or type 'syntia roll 20' in chat.")
 
 
+# The tools the AI may call, described ONCE in a neutral form. Gemini and Ollama
+# want different shapes, so we build each provider's version from this list —
+# edit a tool here and both backends stay in sync.
+# Each property is (type, description).
+TOOL_SPECS = [
+    {
+        "name": "play_music",
+        "description": (
+            "Play a song, artist, or playlist in the user's voice channel. "
+            "Use whenever the user wants to listen to, put on, or play music."
+        ),
+        "properties": {
+            "query": ("string", "What to search for: song, artist, playlist, or link."),
+            "start_seconds": (
+                "integer",
+                "Where to start playback, in seconds. Convert 'from 10 minutes "
+                "in' to 600. Use 0 to start at the beginning.",
+            ),
+        },
+        "required": ["query"],
+    },
+    {
+        "name": "stop_music",
+        "description": "Stop playback and leave the voice channel.",
+        "properties": {},
+        "required": [],
+    },
+    {
+        "name": "skip_song",
+        "description": "Skip the current song and play the next one in the queue.",
+        "properties": {},
+        "required": [],
+    },
+    {
+        "name": "shuffle_queue",
+        "description": "Randomly shuffle the order of the upcoming songs in the queue.",
+        "properties": {},
+        "required": [],
+    },
+]
+
+_GEMINI_TYPES = {"string": types.Type.STRING, "integer": types.Type.INTEGER}
+
+
+def _build_gemini_tools():
+    declarations = []
+    for spec in TOOL_SPECS:
+        props = {
+            name: types.Schema(type=_GEMINI_TYPES[kind], description=desc)
+            for name, (kind, desc) in spec["properties"].items()
+        }
+        declarations.append(
+            types.FunctionDeclaration(
+                name=spec["name"],
+                description=spec["description"],
+                parameters=types.Schema(
+                    type=types.Type.OBJECT, properties=props, required=spec["required"]
+                ),
+            )
+        )
+    return [types.Tool(function_declarations=declarations)]
+
+
+def _build_ollama_tools():
+    tools = []
+    for spec in TOOL_SPECS:
+        props = {
+            name: {"type": kind, "description": desc}
+            for name, (kind, desc) in spec["properties"].items()
+        }
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec["name"],
+                    "description": spec["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": props,
+                        "required": spec["required"],
+                    },
+                },
+            }
+        )
+    return tools
+
+
+GEMINI_TOOLS = _build_gemini_tools()
+OLLAMA_TOOLS = _build_ollama_tools()
+
+
+async def generate_gemini(system: str, prompt: str) -> dict:
+    # Returns a normalized result so ask_ai doesn't care which backend ran:
+    #   {"type": "text", "text": ...}  or  {"type": "tool", "name": ..., "args": {...}}
+    response = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(system_instruction=system, tools=GEMINI_TOOLS),
+    )
+    candidates = response.candidates or []
+    parts = candidates[0].content.parts if candidates and candidates[0].content else []
+    for part in parts:
+        if part.function_call:
+            fc = part.function_call
+            return {"type": "tool", "name": fc.name, "args": dict(fc.args)}
+    return {"type": "text", "text": response.text or ""}
+
+
+async def generate_ollama(system: str, prompt: str) -> dict:
+    # Same normalized result, but talking to the LOCAL Ollama server.
+    response = await ollama_client.chat(
+        model=OLLAMA_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        tools=OLLAMA_TOOLS,
+    )
+    msg = response.message
+    if msg.tool_calls:
+        call = msg.tool_calls[0]  # honor the first tool the model asked for
+        return {"type": "tool", "name": call.function.name, "args": dict(call.function.arguments)}
+    return {"type": "text", "text": msg.content or ""}
+
+
+async def run_tool(message: discord.Message, name: str, args: dict):
+    # Map the tool name the AI chose to the real bot function. One place for
+    # both backends, so this dispatch isn't duplicated.
+    if name == "play_music":
+        start = int(args.get("start_seconds") or 0)
+        await play_music(message, args.get("query", ""), start)
+    elif name == "stop_music":
+        await leave_voice(message)
+    elif name == "skip_song":
+        await skip_song(message)
+    elif name == "shuffle_queue":
+        await shuffle_queue(message)
+
+
 async def ask_ai(message: discord.Message, prompt: str):
-    # The "default" behaviour: send whatever the user typed to Gemini and relay
-    # the reply. Handles typos AND people just wanting to chat.
-    if ai_client is None:
+    # The "default" behaviour: hand the message to the AI. With tools attached it
+    # can either reply with text (chatting) OR ask us to run a command (tool use).
+    # AI_BACKEND in .env decides whether that AI is local (ollama) or cloud (gemini).
+    if AI_BACKEND == "ollama":
+        backend = generate_ollama
+    elif gemini_client is not None:
+        backend = generate_gemini
+    else:
         await message.channel.send(
-            "AI isn't set up yet — add GEMINI_API_KEY to your .env (see README)."
+            "AI isn't set up — add GEMINI_API_KEY to .env, or set AI_BACKEND=ollama."
         )
         return
 
     try:
-        # `typing()` shows the "Syntia is typing…" indicator while we wait.
         async with message.channel.typing():
-            # .aio = the async version, so the bot stays responsive during the call.
-            # system_instruction = the personality/rules; contents = the user's text.
-            response = await ai_client.aio.models.generate_content(
-                model=AI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=build_system_instruction(message),
-                ),
-            )
-        reply = (response.text or "").strip() or "(the AI returned nothing)"
+            result = await backend(build_system_instruction(message), prompt)
     except Exception as error:
-        # Never let one bad API call crash the whole bot — report and move on.
-        reply = f"AI error: {error}"
+        # Never let one bad AI call crash the whole bot — report and move on.
+        await message.channel.send(f"AI error: {error}")
+        return
 
-    # Discord rejects messages longer than 2000 characters, so trim if needed.
-    await message.channel.send(reply[:2000])
+    if result["type"] == "tool":
+        await run_tool(message, result["name"], result["args"])
+    else:
+        reply = (result["text"] or "").strip() or "(the AI returned nothing)"
+        await message.channel.send(reply[:2000])
+
+
+# --- Music (Step 2: a per-server queue + skip + shuffle) ------------------
+
+# How yt-dlp finds audio. "ytsearch" means plain text like "lofi hip hop" gets
+# searched on YouTube; a full YouTube URL also works. noplaylist=True keeps each
+# request to a single track (Spotify-playlist expansion comes in a later step).
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "default_search": "ytsearch",
+    "quiet": True,
+    "no_warnings": True,
+}
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
+
+
+# FFmpeg flags: -vn drops video; reconnect flags help if the stream hiccups.
+# -ss <seconds> (input seek) is how we START PART-WAY into a track. A YouTube
+# "&t=600" only moves the web player; to actually skip ahead we must tell FFmpeg.
+def ffmpeg_options(start_seconds: int = 0) -> dict:
+    before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    if start_seconds > 0:
+        before = f"-ss {start_seconds} " + before
+    return {"before_options": before, "options": "-vn"}
+
+
+# Each server gets its own list of upcoming tracks. Key = guild id, value = list.
+song_queues: dict[int, list[dict]] = {}
+
+
+def get_queue(guild_id: int) -> list:
+    # setdefault: return the existing queue, or create an empty one on first use.
+    return song_queues.setdefault(guild_id, [])
+
+
+async def resolve_track(query: str, start_seconds: int, text_channel) -> dict:
+    # Ask yt-dlp for the audio. Blocking work, so run it off the event loop.
+    data = await asyncio.to_thread(ytdl.extract_info, query, download=False)
+    if "entries" in data:  # a search returns a list of hits; take the first
+        data = data["entries"][0]
+    return {
+        "title": data.get("title", "Unknown"),
+        "stream_url": data["url"],
+        "start_seconds": start_seconds,
+        "channel": text_channel,  # where to announce "Now playing"
+    }
+
+
+def schedule_next(guild: discord.Guild):
+    # Called in FFmpeg's OWN thread when a song ends — we can't await here, so we
+    # hand the coroutine back to the bot's event loop to play the next track.
+    asyncio.run_coroutine_threadsafe(play_next(guild), client.loop)
+
+
+async def play_next(guild: discord.Guild):
+    queue = get_queue(guild.id)
+    voice = guild.voice_client
+    if voice is None or not queue:
+        return  # not connected, or nothing left to play
+    track = queue.pop(0)  # take the song at the front of the line
+    source = await discord.FFmpegOpusAudio.from_probe(
+        track["stream_url"], **ffmpeg_options(track["start_seconds"])
+    )
+    # after=... runs when THIS song finishes -> kick off the next one.
+    voice.play(source, after=lambda error: schedule_next(guild))
+    start = track["start_seconds"]
+    note = f" (from {start // 60}:{start % 60:02d})" if start else ""
+    await track["channel"].send(f"▶️ Now playing: **{track['title']}**{note}")
+
+
+async def play_music(message: discord.Message, query: str, start_seconds: int = 0):
+    # You must be in a voice channel so the bot knows where to join.
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("Join a voice channel first, then try again.")
+        return
+    channel = message.author.voice.channel
+
+    # Connect to your channel (or move there if already connected elsewhere).
+    voice = message.guild.voice_client
+    if voice is None:
+        voice = await channel.connect()
+    elif voice.channel != channel:
+        await voice.move_to(channel)
+
+    async with message.channel.typing():
+        try:
+            track = await resolve_track(query, start_seconds, message.channel)
+        except Exception as error:
+            await message.channel.send(f"Couldn't find that: {error}")
+            return
+
+    queue = get_queue(message.guild.id)
+    queue.append(track)
+
+    # If nothing is playing, start now; otherwise the track waits its turn.
+    if not voice.is_playing() and not voice.is_paused():
+        await play_next(message.guild)
+    else:
+        await message.channel.send(
+            f"➕ Added to queue (#{len(queue)}): **{track['title']}**"
+        )
+
+
+async def skip_song(message: discord.Message):
+    voice = message.guild.voice_client
+    if voice and (voice.is_playing() or voice.is_paused()):
+        voice.stop()  # stopping fires the after= callback, which plays the next
+        await message.channel.send("⏭️ Skipped.")
+    else:
+        await message.channel.send("Nothing is playing.")
+
+
+async def shuffle_queue(message: discord.Message):
+    queue = get_queue(message.guild.id)
+    if len(queue) < 2:
+        await message.channel.send("Not enough songs in the queue to shuffle.")
+        return
+    random.shuffle(queue)  # shuffles the list in place
+    await message.channel.send("🔀 Shuffled the queue.")
+
+
+async def show_queue(message: discord.Message):
+    queue = get_queue(message.guild.id)
+    if not queue:
+        await message.channel.send("The queue is empty.")
+        return
+    lines = [f"{i}. {track['title']}" for i, track in enumerate(queue, 1)]
+    await message.channel.send(("**Up next:**\n" + "\n".join(lines))[:2000])
+
+
+async def leave_voice(message: discord.Message):
+    voice = message.guild.voice_client
+    if voice is None:
+        await message.channel.send("I'm not in a voice channel.")
+        return
+    get_queue(message.guild.id).clear()  # forget the queue when we leave
+    await voice.disconnect()
+    await message.channel.send("Left the voice channel. 👋")
 
 
 @client.event
@@ -166,6 +457,29 @@ async def on_message(message: discord.Message):
                 sides = int(args[0])
             result = random.randint(1, sides)  # both ends included: 1..sides
             await message.channel.send(f"🎲 You rolled a **{result}** (1–{sides}).")
+
+        case "play":
+            # Everything after "play" is the song name or YouTube link.
+            query = " ".join(args)
+            if not query:
+                await message.channel.send(
+                    "Give me a song or link, e.g. `syntia play lofi hip hop`."
+                )
+            else:
+                await play_music(message, query)
+
+        case "stop" | "leave":
+            # One case can match several words with the | (or) pattern.
+            await leave_voice(message)
+
+        case "skip":
+            await skip_song(message)
+
+        case "shuffle":
+            await shuffle_queue(message)
+
+        case "queue":
+            await show_queue(message)
 
         case _:
             # Nothing matched — maybe a typo, maybe they just want to chat.
