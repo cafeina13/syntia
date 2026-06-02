@@ -242,18 +242,24 @@ OLLAMA_TOOLS = _build_ollama_tools()
 
 async def generate_gemini(system: str, prompt: str) -> dict:
     # Returns a normalized result so ask_ai doesn't care which backend ran:
-    #   {"type": "text", "text": ...}  or  {"type": "tool", "name": ..., "args": {...}}
+    #   {"type": "tools", "calls": [{"name", "args"}, ...]}  or  {"type": "text", "text": ...}
+    # A single response may contain SEVERAL tool calls (e.g. "shuffle then skip").
     response = await gemini_client.aio.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=system, tools=GEMINI_TOOLS),
+        config=types.GenerateContentConfig(
+            system_instruction=system, tools=GEMINI_TOOLS
+        ),
     )
     candidates = response.candidates or []
     parts = candidates[0].content.parts if candidates and candidates[0].content else []
-    for part in parts:
-        if part.function_call:
-            fc = part.function_call
-            return {"type": "tool", "name": fc.name, "args": dict(fc.args)}
+    calls = [
+        {"name": part.function_call.name, "args": dict(part.function_call.args)}
+        for part in parts
+        if part.function_call
+    ]
+    if calls:
+        return {"type": "tools", "calls": calls}
     return {"type": "text", "text": response.text or ""}
 
 
@@ -269,8 +275,12 @@ async def generate_ollama(system: str, prompt: str) -> dict:
     )
     msg = response.message
     if msg.tool_calls:
-        call = msg.tool_calls[0]  # honor the first tool the model asked for
-        return {"type": "tool", "name": call.function.name, "args": dict(call.function.arguments)}
+        # The model may ask for several tools at once; keep them all, in order.
+        calls = [
+            {"name": call.function.name, "args": dict(call.function.arguments)}
+            for call in msg.tool_calls
+        ]
+        return {"type": "tools", "calls": calls}
     return {"type": "text", "text": msg.content or ""}
 
 
@@ -312,8 +322,10 @@ async def ask_ai(message: discord.Message, prompt: str):
         await message.channel.send(f"AI error: {error}")
         return
 
-    if result["type"] == "tool":
-        await run_tool(message, result["name"], result["args"])
+    if result["type"] == "tools":
+        # Run each requested tool in the order the AI returned them.
+        for call in result["calls"]:
+            await run_tool(message, call["name"], call["args"])
     else:
         reply = (result["text"] or "").strip() or "(the AI returned nothing)"
         await message.channel.send(reply[:2000])
@@ -725,6 +737,7 @@ async def echo(interaction: discord.Interaction, text: str):
 
 
 # --- Start the bot --------------------------------------------------------
+
 
 def main():
     if not TOKEN:
