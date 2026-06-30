@@ -7,7 +7,8 @@ commented — read it top to bottom to follow how each piece works.
 ## What it can do
 
 - **Music** in a voice channel from **YouTube, YouTube Music, and Spotify**
-  (songs, albums, and playlists) — a queue with skip / previous / shuffle / clear.
+  (songs, albums, and playlists) — a queue with skip / previous / shuffle / clear,
+  and seeking within a track (forward / rewind / jump to a timestamp).
 - **AI chat**: anything it doesn't recognize as a command goes to an AI, which
   can reply *or* decide to run a music command itself (tool calling).
 - **Switchable AI backend**: cloud **Gemini** (free tier) or local **Ollama** —
@@ -110,6 +111,9 @@ Type these in any text channel (you must be in a voice channel for music):
 | `syntia clear` | Empty the upcoming queue |
 | `syntia skip` | Skip to the next song |
 | `syntia previous` (or `prev` / `back`) | Replay the previous song |
+| `syntia forward [N]` (or `fwd` / `ff`) | Jump ahead N seconds in the current track (default 30) |
+| `syntia rewind [N]` (or `rw`) | Jump back N seconds (default 30) |
+| `syntia seek <time>` | Jump to a position, e.g. `syntia seek 1:02:00` |
 | `syntia shuffle` | Shuffle the queue |
 | `syntia shuffle <playlist>` | Load a playlist and shuffle-play it |
 | `syntia stop` (or `leave` / `bye`) | Stop and leave the voice channel |
@@ -140,6 +144,7 @@ Slash commands also exist: `/ping`, `/hello`, `/echo`.
 ```
 DISCORD_TOKEN=        # required — your bot token
 GUILD_ID=             # optional — your server ID for instant slash-command updates
+OWNER_ID=0            # optional — your Discord user ID; the AI treats it as the verified owner
 AI_BACKEND=gemini     # "gemini" or "ollama"
 GEMINI_API_KEY=       # needed if AI_BACKEND=gemini
 OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M   # used if AI_BACKEND=ollama
