@@ -127,6 +127,25 @@ async def on_message(message: discord.Message):
         case "skip":
             await music.skip_song(message)
 
+        case "forward" | "fwd" | "ff":
+            # Jump ahead in the current track. Optional number of seconds (default 30).
+            secs = int(args[0]) if args and args[0].isdigit() else 30
+            await music.seek(message, secs)
+
+        case "rewind" | "rw":
+            secs = int(args[0]) if args and args[0].isdigit() else 30
+            await music.seek(message, -secs)
+
+        case "seek":
+            # Jump TO an absolute time: syntia seek 1:02:00 (or 5:25, or 325)
+            secs = music.parse_timestamp(args[0]) if args else None
+            if secs is None:
+                await message.channel.send(
+                    "Give me a time, e.g. `syntia seek 1:02:00`."
+                )
+            else:
+                await music.seek(message, to=secs)
+
         case "shuffle":
             await music.shuffle_queue(message, " ".join(args))
 

@@ -23,7 +23,8 @@ Your tools and when to use them:
 - play_music(query, start_seconds): play NOW — replaces the queue and starts this song/playlist immediately. For "play …", "put on …", or a bare song/link. Set `start_seconds` only if they ask to start at a time (e.g. "from 2 minutes in" → 120); otherwise 0.
 - add_to_queue(query, start_seconds): ADD to the end without interrupting. For "add …", "queue …", "play next", "also play …".
 - clear_queue(): for "clear the queue", "empty the queue" (keeps the current song).
-- skip_song(): for "skip", "next", "skip this" etc.
+- skip_song(): for "skip", "next", "skip this" etc. (jumps to the NEXT track)
+- seek: move WITHIN the current track. To jump TO a time use to_seconds ("go to 1:02:00" → 3720); to move relative use seconds ("ahead 2 min" → 120, "back 30s" → -30). Use this (not skip_song) for moving inside a long song/video.
 - play_previous(): for "previous", "go back", "play the last song" etc.
 - shuffle_queue(): for "shuffle", "mix it up", "randomize" etc.
 - stop_music(): for "stop", "leave", "disconnect" etc.

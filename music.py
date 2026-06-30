@@ -7,6 +7,7 @@ these functions; the AI reaches them via ai.run_tool.
 import asyncio
 import random
 import re
+import time
 
 import discord
 import yt_dlp
@@ -51,6 +52,13 @@ class GuildPlayer:
         self.queue = []  # upcoming tracks (front of the list = next to play)
         self.history = []  # tracks already played (oldest first)
         self.current = None  # the track playing right now
+        self.offset = 0  # seconds into the track where the current source began
+        self.started_at = 0.0  # monotonic clock time when the current source began
+        self.seek_target = None  # (entry, seconds) set by seek() so play_next replays it
+
+    def position(self) -> float:
+        # How many seconds into the current track we are right now.
+        return self.offset + (time.monotonic() - self.started_at)
 
 
 players: dict[int, GuildPlayer] = {}
@@ -77,10 +85,47 @@ def schedule_next(guild: discord.Guild):
     asyncio.run_coroutine_threadsafe(play_next(guild), client.loop)
 
 
+async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce: bool = True) -> bool:
+    # Start ONE track at `offset` seconds in. Shared by normal playback and by
+    # seek (which restarts the same track at a new offset). Returns True if it
+    # actually started, False if the audio couldn't be loaded.
+    voice = guild.voice_client
+    if voice is None:
+        return False
+    try:
+        stream_url, title = await resolve_stream(entry["query"])
+    except Exception as error:
+        await entry["channel"].send(
+            f"Skipping **{entry['title']}** (couldn't load it: {error})."
+        )
+        return False
+    entry["title"] = title  # remember the real YouTube title for later display
+    player = get_player(guild.id)
+    player.current = entry
+    player.offset = int(offset)
+    source = await discord.FFmpegOpusAudio.from_probe(
+        stream_url, **ffmpeg_options(int(offset))
+    )
+    # after=... runs when THIS song finishes -> kick off the next one.
+    voice.play(source, after=lambda error: schedule_next(guild))
+    player.started_at = time.monotonic()  # start the position clock
+    if announce:
+        note = f" (from {int(offset) // 60}:{int(offset) % 60:02d})" if offset else ""
+        await entry["channel"].send(f"▶️ Now playing: **{title}**{note}")
+    return True
+
+
 async def play_next(guild: discord.Guild):
     player = get_player(guild.id)
     voice = guild.voice_client
     if voice is None:
+        return
+    # A seek is in progress? Replay the SAME track at the new position, WITHOUT
+    # touching history or the queue.
+    if player.seek_target is not None:
+        entry, target = player.seek_target
+        player.seek_target = None
+        await _start_track(guild, entry, target, announce=False)
         return
     # The song that just finished (if any) moves into history so we can go back.
     if player.current is not None:
@@ -89,24 +134,8 @@ async def play_next(guild: discord.Guild):
     # Loop so a track we can't load just gets skipped instead of stopping music.
     while player.queue:
         entry = player.queue.pop(0)  # take the song at the front of the line
-        try:
-            stream_url, title = await resolve_stream(entry["query"])
-        except Exception as error:
-            await entry["channel"].send(
-                f"Skipping **{entry['title']}** (couldn't load it: {error})."
-            )
-            continue
-        entry["title"] = title  # remember the real YouTube title for later display
-        player.current = entry
-        source = await discord.FFmpegOpusAudio.from_probe(
-            stream_url, **ffmpeg_options(entry["start_seconds"])
-        )
-        # after=... runs when THIS song finishes -> kick off the next one.
-        voice.play(source, after=lambda error: schedule_next(guild))
-        start = entry["start_seconds"]
-        note = f" (from {start // 60}:{start % 60:02d})" if start else ""
-        await entry["channel"].send(f"▶️ Now playing: **{title}**{note}")
-        return
+        if await _start_track(guild, entry, entry["start_seconds"]):
+            return
 
 
 def _spotify_query(track: dict) -> str:
@@ -292,6 +321,49 @@ async def skip_song(message: discord.Message):
         await message.channel.send("⏭️ Skipped.")
     else:
         await message.channel.send("Nothing is playing.")
+
+
+def fmt_time(seconds: int) -> str:
+    # 3720 -> "1:02:00", 325 -> "5:25". Used in the "Jumped to ..." message.
+    hours, rem = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def parse_timestamp(text: str):
+    # "1:02:00" -> 3720, "5:25" -> 325, "90" -> 90. Returns seconds, or None if
+    # the text isn't a valid time.
+    parts = text.split(":")
+    if len(parts) > 3 or not all(p.isdigit() for p in parts):
+        return None
+    total = 0
+    for part in parts:
+        total = total * 60 + int(part)
+    return total
+
+
+async def seek(message: discord.Message, seconds: int = 0, to: int | None = None):
+    # Move within the CURRENT track. `to` = an ABSOLUTE position to jump TO;
+    # `seconds` = a RELATIVE jump (positive forward, negative back). We can't move
+    # the playhead in place, so we restart the same track at the new offset;
+    # seek_target tells play_next to replay rather than advance.
+    player = get_player(message.guild.id)
+    voice = message.guild.voice_client
+    if voice is None or player.current is None or not voice.is_playing():
+        await message.channel.send("Nothing is playing to seek.")
+        return
+    if to is not None:
+        target = max(0, int(to))
+        forward = target >= player.position()
+    else:
+        target = max(0, int(player.position() + seconds))
+        forward = seconds >= 0
+    player.seek_target = (player.current, target)
+    voice.stop()  # fires the after= callback -> play_next replays at `target`
+    arrow = "⏩" if forward else "⏪"
+    await message.channel.send(f"{arrow} Jumped to {fmt_time(target)}.")
 
 
 async def play_previous(message: discord.Message):

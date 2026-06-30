@@ -94,6 +94,26 @@ TOOL_SPECS = [
         "properties": {},
         "required": [],
     },
+    {
+        "name": "seek",
+        "description": (
+            "Move WITHIN the current song. To jump TO a position use to_seconds "
+            "('jump to 5:25' -> 325, 'go to 1 hour 2 minutes' -> 3720). To move "
+            "RELATIVE to now use seconds ('ahead 2 minutes' -> 120, 'back 30s' -> "
+            "-30). Provide only one of them."
+        ),
+        "properties": {
+            "seconds": (
+                "integer",
+                "Relative jump from the current spot: positive = forward, negative = backward.",
+            ),
+            "to_seconds": (
+                "integer",
+                "Absolute position to jump TO, in seconds from the start of the track.",
+            ),
+        },
+        "required": [],
+    },
 ]
 
 _GEMINI_TYPES = {"string": types.Type.STRING, "integer": types.Type.INTEGER}
@@ -209,6 +229,13 @@ async def run_tool(message: discord.Message, name: str, args: dict):
         await music.shuffle_queue(message)
     elif name == "play_previous":
         await music.play_previous(message)
+    elif name == "seek":
+        to = args.get("to_seconds")
+        await music.seek(
+            message,
+            int(args.get("seconds") or 0),
+            int(to) if to is not None else None,
+        )
 
 
 async def ask_ai(message: discord.Message, prompt: str):
