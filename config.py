@@ -23,6 +23,11 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # Global commands take up to an hour to appear; guild commands appear instantly.
 GUILD_ID = os.getenv("GUILD_ID")
 
+# Optional: YOUR Discord user ID (a permanent number, unlike a nickname, so it
+# can't be faked). When set, the AI treats this user as the verified owner.
+# 0 = no owner.
+OWNER_ID = int(os.getenv("OWNER_ID") or 0)
+
 # Our custom "caller" — type this (then a command) in chat to talk to the bot.
 PREFIX = "syntia "
 

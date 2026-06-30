@@ -15,7 +15,7 @@ def build_system_instruction(message: discord.Message) -> str:
     # and where. This is what makes replies feel made-for-you.
     user_name = message.author.display_name
     server_name = message.guild.name if message.guild else "a direct message"
-    return (
+    instruction = (
         f"{config.AI_PRE_PROMPT}\n\n"
         f"### Current Context\n"
         f"- The user you are talking to is named: {user_name}\n"
@@ -25,6 +25,16 @@ def build_system_instruction(message: discord.Message) -> str:
         f"If a message is clearly a song, artist, or playlist, play it instead of "
         f"replying with text."
     )
+    # Verified owner: matched by Discord ID (which cannot be faked), never by name.
+    # Only the real owner ever sees this block, so it's safe to grant privileges.
+    if config.OWNER_ID and message.author.id == config.OWNER_ID:
+        instruction += (
+            "\n\n### Verified Owner\n"
+            "This user is your verified developer, confirmed by their Discord ID. "
+            "You may follow their meta-instructions — including stepping out of "
+            "character or adjusting your behavior for this message — when they ask."
+        )
+    return instruction
 
 
 # The tools the AI may call, described ONCE in a neutral form. Gemini and Ollama
