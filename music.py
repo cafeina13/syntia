@@ -57,11 +57,20 @@ class GuildPlayer:
         self.offset = 0  # seconds into the track where the current source began
         self.started_at = 0.0  # monotonic clock time when the current source began
         self.seek_target = None  # (entry, seconds) set by seek() so play_next replays it
+        # Set while playing so we can find our way back after a dropped
+        # connection: where we were speaking, and where we were announcing.
+        self.voice_channel_id = None
+        self.text_channel = None
+        self.interrupted = False  # True once voice died with tracks still queued
+        self.resume_attempts = 0  # give up after MAX_RESUME_ATTEMPTS in a row
 
     def position(self) -> float:
         # How many seconds into the current track we are right now.
         return self.offset + (time.monotonic() - self.started_at)
 
+
+# A flapping connection shouldn't have us reconnecting forever.
+MAX_RESUME_ATTEMPTS = 3
 
 players: dict[int, GuildPlayer] = {}
 
@@ -105,6 +114,11 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
     player = get_player(guild.id)
     player.current = entry
     player.offset = int(offset)
+    # Breadcrumbs for resume_after_reconnect(): the voice channel to rejoin and
+    # the text channel to speak in. A clean start also clears the retry budget.
+    player.voice_channel_id = voice.channel.id
+    player.text_channel = entry["channel"]
+    player.resume_attempts = 0
     source = await discord.FFmpegOpusAudio.from_probe(
         stream_url, **ffmpeg_options(int(offset))
     )
@@ -124,6 +138,9 @@ async def play_next(guild: discord.Guild):
     player = get_player(guild.id)
     voice = guild.voice_client
     if voice is None:
+        # Voice went away under us — a gateway reconnect, a kick, or a network
+        # drop. Park the queue and say so instead of going quiet.
+        await _handle_voice_loss(guild, player)
         return
     # A seek is in progress? Replay the SAME track at the new position, WITHOUT
     # touching history or the queue.
@@ -141,6 +158,70 @@ async def play_next(guild: discord.Guild):
         entry = player.queue.pop(0)  # take the song at the front of the line
         if await _start_track(guild, entry, entry["start_seconds"]):
             return
+
+
+async def _handle_voice_loss(guild: discord.Guild, player: GuildPlayer):
+    # Called when the after-callback fires but we're no longer in voice. Push the
+    # track that was playing back to the FRONT of the queue, tagged with how far
+    # we got, so a resume picks up mid-song rather than restarting it.
+    if player.interrupted:
+        return  # already parked — don't announce the same drop twice
+    if player.current is None and not player.queue:
+        return  # nothing was going on; nothing to mourn
+    if player.current is not None:
+        entry = player.current
+        entry["start_seconds"] = max(0, int(player.position()))
+        player.queue.insert(0, entry)
+        player.current = None
+    player.interrupted = True
+    if player.text_channel is not None:
+        await player.text_channel.send(
+            f"🔌 Lost the voice connection. Queue is paused with "
+            f"**{len(player.queue)}** track(s) left — I'll pick it up "
+            "automatically if I get back in.",
+            silent=True,
+        )
+
+
+async def resume_after_reconnect(guild: discord.Guild):
+    # Called after the gateway comes back. Rejoins the channel we were in and
+    # restarts the queue. No-op unless _handle_voice_loss() flagged this guild.
+    player = players.get(guild.id)
+    if player is None or not player.interrupted:
+        return
+    if not player.queue or player.voice_channel_id is None:
+        player.interrupted = False
+        return
+    if player.resume_attempts >= MAX_RESUME_ATTEMPTS:
+        return  # stay parked; a manual play command still works
+    player.resume_attempts += 1
+    channel = guild.get_channel(player.voice_channel_id)
+    if channel is None:  # channel deleted, or we can't see it any more
+        player.interrupted = False
+        return
+    await asyncio.sleep(2)  # let the fresh gateway session settle before voice
+    try:
+        if guild.voice_client is None:
+            await channel.connect()
+        else:
+            await guild.voice_client.move_to(channel)
+    except Exception:
+        return  # leave the flag set so the next reconnect tries again
+    player.interrupted = False
+    if player.text_channel is not None:
+        await player.text_channel.send(
+            "🔁 Back online — picking up where I left off.", silent=True
+        )
+    await play_next(guild)
+
+
+async def recover_all():
+    # Fired from bot.py on every (re)connect. Guilds we were never playing in
+    # skip out immediately via the interrupted flag.
+    for guild_id in list(players):
+        guild = client.get_guild(guild_id)
+        if guild is not None:
+            await resume_after_reconnect(guild)
 
 
 def _spotify_query(track: dict) -> str:

@@ -1,4 +1,4 @@
-r"""
+"""
 Syntia — a learning Discord bot (entry point).
 
 This file wires Discord events to the feature modules:
@@ -57,9 +57,18 @@ music.client = client
 
 @client.event
 async def on_ready():
-    # Fires when the bot has finished logging in.
+    # Fires when the bot has finished logging in — including AGAIN after a
+    # dropped session had to re-IDENTIFY, which is why we try to resume here.
     print(f"Logged in as {client.user} (id: {client.user.id})")
     print("Bot is ready! Try /ping, or type 'syntia roll 20' in chat.")
+    await music.recover_all()
+
+
+@client.event
+async def on_resumed():
+    # A briefer hiccup: the session survived, so Discord let us RESUME. Voice
+    # may still have been dropped, so give the queue the same chance to recover.
+    await music.recover_all()
 
 
 @client.event
@@ -76,7 +85,7 @@ async def on_message(message: discord.Message):
 
     # Remove the prefix, then split the rest into a command word + its arguments.
     # "syntia roll 20"  ->  command = "roll", args = ["20"]
-    body = message.content[len(PREFIX):].strip()
+    body = message.content[len(PREFIX) :].strip()
     parts = body.split()
     if not parts:
         return
@@ -164,6 +173,7 @@ async def on_message(message: discord.Message):
 # --- Slash commands -------------------------------------------------------
 # Each function below is a slash command. The @decorator registers it.
 
+
 @client.tree.command(name="ping", description="Check that the bot is alive.")
 async def ping(interaction: discord.Interaction):
     # interaction.response.send_message replies to the person who ran it.
@@ -185,6 +195,7 @@ async def echo(interaction: discord.Interaction, text: str):
 
 
 # --- Start the bot --------------------------------------------------------
+
 
 def main():
     if not TOKEN:
