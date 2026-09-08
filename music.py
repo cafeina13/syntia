@@ -113,7 +113,10 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
     player.started_at = time.monotonic()  # start the position clock
     if announce:
         note = f" (from {int(offset) // 60}:{int(offset) % 60:02d})" if offset else ""
-        await entry["channel"].send(f"▶️ Now playing: **{title}**{note}")
+        # silent=True -> the message still posts, but Discord skips the push
+        # notification. This one fires on its own at every track change, so a
+        # ping per song in a long queue gets old fast.
+        await entry["channel"].send(f"▶️ Now playing: **{title}**{note}", silent=True)
     return True
 
 
