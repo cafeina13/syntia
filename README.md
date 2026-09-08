@@ -72,19 +72,32 @@ AI_BACKEND=gemini        # "gemini" (cloud) or "ollama" (local)
 The bot's personality and rules live in **`System_Prompt.md`** — edit that to
 change how the AI behaves (restart to apply).
 
-### 6. Spotify (optional — only for Spotify links)
+### 6. Spotify (fully optional)
+
+**Spotify links work with no setup at all.** For any *public* playlist, album, or
+track, the bot reads the track list off Spotify's public embed page and searches
+each song on YouTube. No credentials, no login.
+
+Adding a Spotify app only buys you one thing: **no track cap**. The embed page
+returns a limited slice of a long playlist (50–100 tracks, varies), while the
+official API returns all of it. Set it up only if you queue playlists longer
+than that:
 
 1. Create a free app at <https://developer.spotify.com/dashboard>. For the
    Redirect URI use `http://127.0.0.1:8888/callback` (use `127.0.0.1`, not
    `localhost`). Copy the **Client ID** and **Client Secret** into `.env`.
-2. Reading playlists needs a one-time login (Spotify blocks playlists for
-   app-only tokens). Run it once:
+2. Log in once so the bot can read playlists with your account:
    ```powershell
    .venv\Scripts\python.exe spotify_login.py
    ```
    A browser opens; approve, and a token is cached to `.spotify_cache`.
-3. Note: in Spotify "Development Mode" you can reliably read **playlists owned by
-   the logged-in account**; other people's playlists may be blocked.
+3. In Spotify "Development Mode" the API reliably reads **playlists owned by the
+   logged-in account**. Other people's playlists usually come back 403/404 —
+   that's fine, the bot just falls back to the embed page automatically.
+
+Note the embed fallback depends on the layout of Spotify's public pages, so it
+can break if they change them. If Spotify links suddenly stop resolving, that's
+the first place to look.
 
 ## Run it
 
@@ -148,7 +161,7 @@ OWNER_ID=0            # optional — your Discord user ID; the AI treats it as t
 AI_BACKEND=gemini     # "gemini" or "ollama"
 GEMINI_API_KEY=       # needed if AI_BACKEND=gemini
 OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M   # used if AI_BACKEND=ollama
-SPOTIFY_CLIENT_ID=    # optional — for Spotify links
+SPOTIFY_CLIENT_ID=    # optional — only to lift the track cap on long playlists
 SPOTIFY_CLIENT_SECRET=
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ```

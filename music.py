@@ -5,9 +5,11 @@ these functions; the AI reaches them via ai.run_tool.
 """
 
 import asyncio
+import json
 import random
 import re
 import time
+import urllib.request
 
 import discord
 import yt_dlp
@@ -148,14 +150,26 @@ def _spotify_query(track: dict) -> str:
 
 
 def spotify_tracks(url: str) -> list:
-    # Read a Spotify track / playlist / album link and return YouTube search
-    # strings. Blocking (network), so callers run it via asyncio.to_thread.
+    # Read a Spotify track / playlist / album link -> YouTube search strings.
+    # Blocking (network), so callers run it via asyncio.to_thread.
+    # Prefer the official API (full list, no cap) when we have a login; otherwise
+    # — or for playlists the API can't read, like other people's — scrape the
+    # public embed page.
     match = re.search(r"open\.spotify\.com/(playlist|track|album)/([A-Za-z0-9]+)", url)
     if not match:
         return []
     kind, spotify_id = match.group(1), match.group(2)
-    searches = []
+    if config.spotify_client is not None:
+        try:
+            return _spotify_tracks_api(kind, spotify_id)
+        except Exception:
+            pass  # e.g. someone else's playlist (403) -> fall back to scraping
+    return _scrape_spotify(kind, spotify_id)
 
+
+def _spotify_tracks_api(kind: str, spotify_id: str) -> list:
+    # Official-API path (needs a login). Full track list, no ~100 cap.
+    searches = []
     if kind == "track":
         searches.append(_spotify_query(config.spotify_client.track(spotify_id)))
     elif kind == "playlist":
@@ -171,8 +185,43 @@ def spotify_tracks(url: str) -> list:
             for track in page["items"]:
                 searches.append(_spotify_query(track))
             page = config.spotify_client.next(page) if page.get("next") else None
-
     return [search for search in searches if search]  # drop any empties
+
+
+def _find_tracklist(obj):
+    # Recursively find the "trackList" array inside the embed page's JSON.
+    if isinstance(obj, dict):
+        if isinstance(obj.get("trackList"), list):
+            return obj["trackList"]
+        for value in obj.values():
+            found = _find_tracklist(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_tracklist(value)
+            if found:
+                return found
+    return None
+
+
+def _scrape_spotify(kind: str, spotify_id: str) -> list:
+    # No-API fallback: the public embed page ships the track list as JSON. Works
+    # for any PUBLIC item, but caps at ~100 tracks and can break if Spotify
+    # changes their page. ToS gray area — fine for a personal bot.
+    embed = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
+    request = urllib.request.Request(embed, headers={"User-Agent": "Mozilla/5.0"})
+    html = urllib.request.urlopen(request, timeout=20).read().decode("utf-8", "replace")
+    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not match:
+        return []
+    tracklist = _find_tracklist(json.loads(match.group(1))) or []
+    searches = []
+    for track in tracklist:
+        query = f"{track.get('subtitle', '')} - {track.get('title', '')}".strip(" -")
+        if query:
+            searches.append(query)
+    return searches
 
 
 def is_spotify_url(text: str) -> bool:
@@ -227,12 +276,6 @@ async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
     queue = get_player(message.guild.id).queue
 
     if is_spotify_url(query):
-        if config.spotify_client is None:
-            await message.channel.send(
-                "Spotify playlists need a one-time login. Set SPOTIFY_CLIENT_ID/"
-                "SECRET in .env, run `python spotify_login.py` once, then restart me."
-            )
-            return 0
         async with message.channel.typing():
             try:
                 searches = await asyncio.to_thread(spotify_tracks, query)
@@ -240,7 +283,7 @@ async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
                 await message.channel.send(f"Couldn't read that Spotify link: {error}")
                 return 0
         if not searches:
-            await message.channel.send("That Spotify link had no playable tracks.")
+            await message.channel.send("Couldn't get any tracks from that Spotify link.")
             return 0
         for search in searches:
             queue.append({"query": search, "title": search,
