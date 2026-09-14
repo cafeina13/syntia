@@ -56,6 +56,7 @@ class GuildPlayer:
         self.current = None  # the track playing right now
         self.offset = 0  # seconds into the track where the current source began
         self.started_at = 0.0  # monotonic clock time when the current source began
+        self.paused_at = None  # monotonic clock time of a pause, or None while playing
         self.seek_target = None  # (entry, seconds) set by seek() so play_next replays it
         # Set while playing so we can find our way back after a dropped
         # connection: where we were speaking, and where we were announcing.
@@ -65,8 +66,10 @@ class GuildPlayer:
         self.resume_attempts = 0  # give up after MAX_RESUME_ATTEMPTS in a row
 
     def position(self) -> float:
-        # How many seconds into the current track we are right now.
-        return self.offset + (time.monotonic() - self.started_at)
+        # How many seconds into the current track we are right now. While paused
+        # the clock is frozen at the moment of the pause.
+        now = self.paused_at if self.paused_at is not None else time.monotonic()
+        return self.offset + (now - self.started_at)
 
 
 # A flapping connection shouldn't have us reconnecting forever.
@@ -80,14 +83,23 @@ def get_player(guild_id: int) -> GuildPlayer:
     return players.setdefault(guild_id, GuildPlayer())
 
 
-async def resolve_stream(query: str):
+async def resolve_stream(query: str) -> dict:
     # Ask yt-dlp for a playable audio stream. Blocking, so run it in a thread.
-    # Returns (stream_url, real_title). We resolve LAZILY — only when a track is
-    # about to play — so adding a 50-song Spotify playlist is instant.
+    # We resolve LAZILY — only when a track is about to play — so adding a
+    # 50-song Spotify playlist is instant. Returns:
+    #   url          the audio stream FFmpeg reads
+    #   title        the real video title
+    #   webpage_url  the video's page (for resume links), or None
+    #   duration     length in seconds, or None (e.g. live streams)
     data = await asyncio.to_thread(ytdl.extract_info, query, download=False)
     if "entries" in data:  # a search returns a list of hits; take the first
         data = data["entries"][0]
-    return data["url"], data.get("title", query)
+    return {
+        "url": data["url"],
+        "title": data.get("title", query),
+        "webpage_url": data.get("webpage_url"),
+        "duration": data.get("duration"),
+    }
 
 
 def schedule_next(guild: discord.Guild):
@@ -104,13 +116,20 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
     if voice is None:
         return False
     try:
-        stream_url, title = await resolve_stream(entry["query"])
+        info = await resolve_stream(entry["query"])
     except Exception as error:
         await entry["channel"].send(
             f"Skipping **{entry['title']}** (couldn't load it: {error})."
         )
         return False
+    title = info["title"]
     entry["title"] = title  # remember the real YouTube title for later display
+    entry["duration"] = info["duration"]
+    if info["webpage_url"]:
+        # Pin the exact video. A search like "lofi mix" could find a DIFFERENT
+        # video next time — and a seek, previous, or reconnect re-resolves it.
+        entry["query"] = entry["webpage_url"] = info["webpage_url"]
+    stream_url = info["url"]
     player = get_player(guild.id)
     player.current = entry
     player.offset = int(offset)
@@ -129,8 +148,9 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
     # after=... runs when THIS song finishes -> kick off the next one.
     voice.play(source, after=lambda error: schedule_next(guild))
     player.started_at = time.monotonic()  # start the position clock
+    player.paused_at = None  # a fresh source always starts out playing
     if announce:
-        note = f" (from {int(offset) // 60}:{int(offset) % 60:02d})" if offset else ""
+        note = f" (from {fmt_time(offset)})" if offset else ""
         # silent=True -> the message still posts, but Discord skips the push
         # notification. This one fires on its own at every track change, so a
         # ping per song in a long queue gets old fast.
@@ -324,6 +344,38 @@ def is_youtube_playlist(text: str) -> bool:
     return "youtube.com/playlist" in low or "music.youtube.com/playlist" in low
 
 
+def is_youtube_url(text: str) -> bool:
+    return re.search(r"(^|[/.])(youtube\.com|youtu\.be)/", text.lower()) is not None
+
+
+def youtube_start_seconds(url: str) -> int:
+    # The start time in a YouTube link: "t=3753", "t=3753s", or "t=1h2m33s".
+    # Returns 0 when there's none (or it isn't a YouTube link).
+    if not is_youtube_url(url):
+        return 0
+    match = re.search(r"[?&#]t=([0-9hms]+)", url)
+    if not match:
+        return 0
+    value = match.group(1)
+    if value.isdigit():
+        return int(value)
+    parts = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", value)
+    if not parts:
+        return 0
+    hours, minutes, seconds = (int(part or 0) for part in parts.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def resume_link(url: str | None, seconds: int) -> str | None:
+    # The same YouTube link, set to start at `seconds`. None for anything that
+    # isn't a YouTube link (we can't promise other sites honour "t=").
+    if not url or not is_youtube_url(url):
+        return None
+    url = re.sub(r"([?&])t=[^&#]*&?", r"\1", url).rstrip("?&")  # drop an old t=
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}t={int(seconds)}"
+
+
 def youtube_playlist_entries(url: str) -> list:
     # Enumerate a YouTube / YouTube Music playlist's videos. Blocking, so callers
     # use asyncio.to_thread. Returns [{"query": watch_url, "title": ...}, ...].
@@ -448,6 +500,10 @@ async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
         return len(entries)
 
     # A single song name or link. Stored unresolved; looked up when it plays.
+    # A YouTube link carrying a time ("...&t=3753") starts from there, so the
+    # link `syntia np` hands out picks up exactly where you left off.
+    if not start_seconds:
+        start_seconds = youtube_start_seconds(query)
     queue.append({"query": query, "title": query,
                   "start_seconds": start_seconds, "channel": message.channel})
     if announce_add:
@@ -534,7 +590,8 @@ async def seek(message: discord.Message, seconds: int = 0, to: int | None = None
     # seek_target tells play_next to replay rather than advance.
     player = get_player(message.guild.id)
     voice = message.guild.voice_client
-    if voice is None or player.current is None or not voice.is_playing():
+    was_paused = voice is not None and voice.is_paused()
+    if voice is None or player.current is None or not (voice.is_playing() or was_paused):
         await message.channel.send("Nothing is playing to seek.")
         return
     if to is not None:
@@ -544,9 +601,46 @@ async def seek(message: discord.Message, seconds: int = 0, to: int | None = None
         target = max(0, int(player.position() + seconds))
         forward = seconds >= 0
     player.seek_target = (player.current, target)
-    voice.stop()  # fires the after= callback -> play_next replays at `target`
+    # Fires the after= callback -> play_next replays at `target`. The restarted
+    # track starts out playing, so seeking also un-pauses.
+    voice.stop()
     arrow = "⏩" if forward else "⏪"
-    await message.channel.send(f"{arrow} Jumped to {fmt_time(target)}.")
+    note = " (and resumed)" if was_paused else ""
+    await message.channel.send(f"{arrow} Jumped to {fmt_time(target)}{note}.")
+
+
+async def pause_music(message: discord.Message):
+    # Pause the current song in place. A paused bot counts as idle, so the idle
+    # timeout still applies.
+    player = get_player(message.guild.id)
+    voice = message.guild.voice_client
+    if voice is not None and voice.is_paused():
+        await message.channel.send("Already paused. `syntia resume` to continue.")
+        return
+    if voice is None or not voice.is_playing():
+        await message.channel.send("Nothing is playing.")
+        return
+    voice.pause()
+    player.paused_at = time.monotonic()  # freeze the position clock
+    await message.channel.send("⏸️ Paused. `syntia resume` to continue.")
+
+
+async def resume_music(message: discord.Message):
+    player = get_player(message.guild.id)
+    voice = message.guild.voice_client
+    if voice is not None and voice.is_playing():
+        await message.channel.send("It's already playing.")
+        return
+    if voice is None or not voice.is_paused():
+        await message.channel.send("Nothing is paused.")
+        return
+    if player.paused_at is not None:
+        # Slide the start time forward by the length of the pause, so position()
+        # doesn't count the paused minutes as listened.
+        player.started_at += time.monotonic() - player.paused_at
+        player.paused_at = None
+    voice.resume()
+    await message.channel.send("▶️ Resumed.")
 
 
 async def play_previous(message: discord.Message):
@@ -598,6 +692,32 @@ async def shuffle_queue(message: discord.Message, query: str = ""):
         return
     random.shuffle(queue)  # shuffles the list in place
     await message.channel.send("🔀 Shuffled the queue.")
+
+
+async def now_playing(message: discord.Message):
+    # What's playing and how far in — plus a command that restarts it from this
+    # exact spot, handy before restarting the bot during a long mix.
+    player = get_player(message.guild.id)
+    voice = message.guild.voice_client
+    if (voice is None or player.current is None
+            or not (voice.is_playing() or voice.is_paused())):
+        await message.channel.send("Nothing is playing.")
+        return
+    entry = player.current
+    position = int(player.position())
+    duration = entry.get("duration")
+    if duration:
+        position = min(position, int(duration))
+        timing = f"{fmt_time(position)} / {fmt_time(duration)}"
+    else:
+        timing = fmt_time(position)
+    state = " (paused)" if voice.is_paused() else ""
+    lines = [f"🎵 **{entry['title']}**", f"`{timing}`{state}"]
+    link = resume_link(entry.get("webpage_url"), position)
+    if link:
+        # In backticks: easy to copy, and Discord won't unfurl a big preview.
+        lines.append(f"Pick up here later: `syntia play {link}`")
+    await message.channel.send("\n".join(lines))
 
 
 async def show_queue(message: discord.Message):
@@ -702,7 +822,7 @@ async def check_idle():
     for voice in list(client.voice_clients):
         guild = voice.guild
         setting = get_timeout(guild.id)
-        idle = not (voice.is_playing() or voice.is_paused())
+        idle = not voice.is_playing()  # a paused song counts as idle too
         alone = not any(not member.bot for member in voice.channel.members)
         if not setting["enabled"] or not (idle or alone):
             idle_since.pop(guild.id, None)

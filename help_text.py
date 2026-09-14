@@ -9,8 +9,11 @@ COMMANDS = {
     "Music": [
         ("syntia play <song / playlist / link>", "Replace the queue and play now"),
         ("syntia add <...>", "Append to the queue (alias: enqueue)"),
+        ("syntia np", "Current track, timestamp, and a link to resume later (aliases: now, current, nowplaying)"),
         ("syntia queue", "Show what's playing and what's next"),
         ("syntia clear", "Empty the upcoming queue"),
+        ("syntia pause", "Pause the current song"),
+        ("syntia resume", "Continue a paused song (alias: unpause)"),
         ("syntia skip", "Skip to the next song"),
         ("syntia previous", "Replay the previous song (aliases: prev, back)"),
         ("syntia forward [N]", "Jump ahead N seconds, default 30 (aliases: fwd, ff)"),

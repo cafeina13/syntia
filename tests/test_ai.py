@@ -15,7 +15,8 @@ def recorded(monkeypatch):
     # Swap every music function the AI can reach for a recorder.
     calls = []
     names = ["play_music", "add_music", "clear_queue", "stop_music", "leave_voice",
-             "skip_song", "shuffle_queue", "play_previous", "seek", "set_volume",
+             "now_playing", "pause_music", "resume_music", "skip_song", "shuffle_queue",
+             "play_previous", "seek", "set_volume",
              "join_voice"]
     for name in names:
         async def record(*args, _name=name):
@@ -47,6 +48,9 @@ def test_required_arguments_exist():
     ("clear_queue", {}, ("clear_queue", ())),
     ("stop_music", {}, ("stop_music", ())),
     ("leave_voice", {}, ("leave_voice", ())),
+    ("now_playing", {}, ("now_playing", ())),
+    ("pause_music", {}, ("pause_music", ())),
+    ("resume_music", {}, ("resume_music", ())),
     ("skip_song", {}, ("skip_song", ())),
     ("shuffle_queue", {}, ("shuffle_queue", ())),
     ("play_previous", {}, ("play_previous", ())),

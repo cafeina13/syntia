@@ -106,6 +106,31 @@ TOOL_SPECS = [
         "required": [],
     },
     {
+        "name": "now_playing",
+        "description": (
+            "Show the current track, how far into it we are, and a link to resume "
+            "from that spot later. Use for 'what song is this', 'where are we', "
+            "'what's the timestamp'."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    {
+        "name": "pause_music",
+        "description": (
+            "Pause the current song in place, keeping the queue. Use for 'pause', "
+            "'hold on', 'wait a sec'. Different from stop_music, which ends it."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    {
+        "name": "resume_music",
+        "description": "Continue a paused song. Use for 'resume', 'unpause', 'continue'.",
+        "properties": {},
+        "required": [],
+    },
+    {
         "name": "skip_song",
         "description": "Skip the current song and play the next one in the queue.",
         "properties": {},
@@ -283,6 +308,12 @@ async def run_tool(message: discord.Message, name: str, args: dict):
         await music.stop_music(message)
     elif name == "leave_voice":
         await music.leave_voice(message)
+    elif name == "now_playing":
+        await music.now_playing(message)
+    elif name == "pause_music":
+        await music.pause_music(message)
+    elif name == "resume_music":
+        await music.resume_music(message)
     elif name == "skip_song":
         await music.skip_song(message)
     elif name == "shuffle_queue":

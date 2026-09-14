@@ -128,8 +128,11 @@ Type these in any text channel (you must be in a voice channel for music):
 |---|---|
 | `syntia play <song / playlist / link>` | **Replace** the queue and play now |
 | `syntia add <…>` (or `enqueue`) | **Append** to the queue |
+| `syntia np` (or `now` / `current` / `nowplaying`) | Show the current track and timestamp, plus a `syntia play …&t=…` command that resumes from that exact spot (handy before restarting the bot) |
 | `syntia queue` | Show what's playing and what's next |
 | `syntia clear` | Empty the upcoming queue |
+| `syntia pause` | Pause the current song |
+| `syntia resume` (or `unpause`) | Continue a paused song |
 | `syntia skip` | Skip to the next song |
 | `syntia previous` (or `prev` / `back`) | Replay the previous song |
 | `syntia forward [N]` (or `fwd` / `ff`) | Jump ahead N seconds in the current track (default 30) |
@@ -148,14 +151,16 @@ Type these in any text channel (you must be in a voice channel for music):
 | `syntia <anything else>` | Talk to the AI (it may also start music) |
 
 `<…>` can be a search ("lofi hip hop"), a YouTube / YouTube Music / Spotify link,
-or a playlist link.
+or a playlist link. A YouTube link with a time in it (`&t=3753`, `?t=1h2m33s`)
+starts playing from that point.
 
 If you mistype a command, the AI points you to the right one (or sends the help
 list). The command list itself lives in `help_text.py` — the help command, `/help`,
 and the AI all read from it.
 
 **Idle timeout:** the bot leaves voice after a few minutes (default 5) with no
-music playing, or with nobody left in the channel. Set the default with
+music playing (a paused song counts as not playing), or with nobody left in the
+channel. Set the default with
 `IDLE_TIMEOUT_MINUTES` in `.env` (`0` = off); `syntia timeout` changes it per
 server until the next restart.
 

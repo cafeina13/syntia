@@ -84,6 +84,13 @@ class FakeVoice:
         self.stop_calls += 1
         self.playing = self.paused = False
 
+    def pause(self):
+        # Like discord.py: is_playing() is False while paused.
+        self.playing, self.paused = False, True
+
+    def resume(self):
+        self.playing, self.paused = True, False
+
     def send_audio_packet(self, data, *, encode=True):
         self.packets.append(data)
 
