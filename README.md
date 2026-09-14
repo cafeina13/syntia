@@ -9,11 +9,16 @@ commented — read it top to bottom to follow how each piece works.
 - **Music** in a voice channel from **YouTube, YouTube Music, and Spotify**
   (songs, albums, and playlists) — a queue with skip / previous / shuffle / clear,
   and seeking within a track (forward / rewind / jump to a timestamp).
+- **Live volume control** for everyone in the channel, even mid-song.
+- **Voice housekeeping**: join a channel without playing, leave automatically
+  after a few quiet minutes (or when everyone's gone), and pick the queue back
+  up mid-song if the voice connection drops.
 - **AI chat**: anything it doesn't recognize as a command goes to an AI, which
-  can reply *or* decide to run a music command itself (tool calling).
+  can reply *or* decide to run a command itself (tool calling), and points you
+  to the right command when you mistype one.
 - **Switchable AI backend**: cloud **Gemini** (free tier) or local **Ollama** —
   set by one line in `.env`.
-- A custom `syntia ` chat prefix, plus a few slash commands.
+- A custom `syntia ` chat prefix, a `help` command, and a few slash commands.
 
 ## Requirements
 
@@ -67,7 +72,13 @@ AI_BACKEND=gemini        # "gemini" (cloud) or "ollama" (local)
   <https://aistudio.google.com/apikey> and set `GEMINI_API_KEY` in `.env`.
 - **Ollama** (local, no API key): install [Ollama](https://ollama.com), pull a
   tool-capable model (`ollama pull qwen2.5:7b-instruct-q4_K_M`), and set
-  `OLLAMA_MODEL` to match. The first reply is slow while the model loads.
+  `OLLAMA_MODEL` to match. Best as a backup for when Gemini's free tier hits its
+  rate limit:
+  - The first reply is slow while the model loads.
+  - The 7B model holds about 5 GB of GPU memory while loaded, which competes
+    with games.
+  - It follows the system prompt less reliably than Gemini: expect the odd
+    missed command, especially with typos or non-English messages.
 
 The bot's personality and rules live in **`System_Prompt.md`** — edit that to
 change how the AI behaves (restart to apply).
@@ -161,21 +172,25 @@ Slash commands also exist: `/help`, `/ping`, `/hello`, `/echo`.
 | `help_text.py` | The command list behind `syntia help`, `/help`, and the AI prompt |
 | `System_Prompt.md` | The AI's personality and rules (plain Markdown) |
 | `spotify_login.py` | One-time Spotify login helper |
+| `tests/` | Offline test suite (see [Running the tests](#running-the-tests)) |
+| `pytest.ini` | Test runner settings |
+| `requirements.txt` | What the bot needs to run |
+| `requirements-dev.txt` | Extra packages for running the tests |
 | `.env` | Your secrets (gitignored — never commit) |
 | `.env.example` | Template for `.env` |
 
 ## `.env` reference
 
 ```
-DISCORD_TOKEN=        # required — your bot token
-GUILD_ID=             # optional — your server ID for instant slash-command updates
-OWNER_ID=0            # optional — your Discord user ID; the AI treats it as the verified owner
-IDLE_TIMEOUT_MINUTES=5  # leave voice after N quiet minutes; 0 = off by default
-DEFAULT_VOLUME=100      # starting playback volume in percent (0-100)
-AI_BACKEND=gemini     # "gemini" or "ollama"
-GEMINI_API_KEY=       # needed if AI_BACKEND=gemini
+DISCORD_TOKEN=            # required — your bot token
+GUILD_ID=                 # optional — your server ID for instant slash-command updates
+OWNER_ID=0                # optional — your Discord user ID; the AI treats it as the verified owner
+IDLE_TIMEOUT_MINUTES=5    # leave voice after N quiet minutes; 0 = off by default
+DEFAULT_VOLUME=100        # starting playback volume in percent (0-100)
+AI_BACKEND=gemini         # "gemini" or "ollama"
+GEMINI_API_KEY=           # needed if AI_BACKEND=gemini
 OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M   # used if AI_BACKEND=ollama
-SPOTIFY_CLIENT_ID=    # optional — only to lift the track cap on long playlists
+SPOTIFY_CLIENT_ID=        # optional — only to lift the track cap on long playlists
 SPOTIFY_CLIENT_SECRET=
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ```
