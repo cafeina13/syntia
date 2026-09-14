@@ -155,6 +155,12 @@ async def on_message(message: discord.Message):
             # One case can match several words with the | (or) pattern.
             await music.leave_voice(message)
 
+        case "pause":
+            await music.pause_music(message)
+
+        case "resume" | "unpause":
+            await music.resume_music(message)
+
         case "skip":
             await music.skip_song(message)
 
@@ -179,6 +185,10 @@ async def on_message(message: discord.Message):
 
         case "shuffle":
             await music.shuffle_queue(message, " ".join(args))
+
+        case "np" | "nowplaying" | "now" | "current":
+            # What's playing, where we are in it, and a link to resume later.
+            await music.now_playing(message)
 
         case "queue":
             await music.show_queue(message)

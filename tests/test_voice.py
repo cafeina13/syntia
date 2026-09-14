@@ -104,7 +104,8 @@ async def test_start_track_applies_volume_and_announces_silently(connected, monk
     music.volumes[message.guild.id] = 25
 
     async def fake_resolve(query):
-        return "https://stream.example/audio", "Real Title"
+        return {"url": "https://stream.example/audio", "title": "Real Title",
+                "webpage_url": "https://www.youtube.com/watch?v=abc", "duration": 300}
 
     monkeypatch.setattr(music, "resolve_stream", fake_resolve)
     monkeypatch.setattr(music.discord, "FFmpegPCMAudio", SilentSource)
@@ -118,7 +119,10 @@ async def test_start_track_applies_volume_and_announces_silently(connected, monk
     assert voice.source.original.kwargs["before_options"].startswith("-ss 90 ")
     assert message.channel.last == "▶️ Now playing: **Real Title** (from 1:30)"
     assert message.channel.silent[-1] is True
-    assert music.get_player(message.guild.id).current["title"] == "Real Title"
+    current = music.get_player(message.guild.id).current
+    assert current["title"] == "Real Title" and current["duration"] == 300
+    # The search is pinned to the exact video, so a seek replays the same one.
+    assert current["query"] == current["webpage_url"] == "https://www.youtube.com/watch?v=abc"
 
 
 async def test_start_track_reports_a_load_failure(connected, monkeypatch):
