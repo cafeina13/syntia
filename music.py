@@ -119,8 +119,12 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
     player.voice_channel_id = voice.channel.id
     player.text_channel = entry["channel"]
     player.resume_attempts = 0
-    source = await discord.FFmpegOpusAudio.from_probe(
-        stream_url, **ffmpeg_options(int(offset))
+    # Decode to raw PCM and wrap it in a volume transformer, so the volume can
+    # change live mid-song. (Passing Opus straight through is cheaper, but its
+    # loudness can't be touched.)
+    source = discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(stream_url, **ffmpeg_options(int(offset))),
+        volume=get_volume(guild.id) / 100,
     )
     # after=... runs when THIS song finishes -> kick off the next one.
     voice.play(source, after=lambda error: schedule_next(guild))
@@ -202,7 +206,8 @@ async def resume_after_reconnect(guild: discord.Guild):
     await asyncio.sleep(2)  # let the fresh gateway session settle before voice
     try:
         if guild.voice_client is None:
-            await channel.connect()
+            voice = await channel.connect()
+            _run_in_background(_clear_speaking_ring(voice))
         else:
             await guild.voice_client.move_to(channel)
     except Exception:
@@ -337,6 +342,55 @@ def youtube_playlist_entries(url: str) -> list:
     return out
 
 
+async def join_voice(message: discord.Message):
+    # Join the user's voice channel WITHOUT playing anything (debugging, and a
+    # base for future voice features). The idle timeout still applies.
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("Join a voice channel first, then try again.")
+        return
+    channel = message.author.voice.channel
+    voice = message.guild.voice_client
+    if voice is not None and voice.channel == channel:
+        await message.channel.send("I'm already here.")
+        return
+    try:
+        voice = await ensure_voice(message)
+    except Exception as error:
+        await message.channel.send(f"Couldn't join **{channel.name}**: {error}")
+        return
+    # Remember where we are, so the idle timeout knows where to say goodbye.
+    player = get_player(message.guild.id)
+    player.voice_channel_id = voice.channel.id
+    player.text_channel = message.channel
+    await message.channel.send(f"Joined **{voice.channel.name}**.")
+
+
+# asyncio only keeps weak references to tasks, so hold on to them until done.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _run_in_background(coro):
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _clear_speaking_ring(voice: discord.VoiceClient):
+    # A freshly connected bot shows a stuck green "speaking" ring until it sends
+    # some audio: the "not speaking" signal from the handshake alone doesn't
+    # clear it. Stopping a song clears it by sending a few silent frames, so we
+    # do the same right after connecting.
+    await asyncio.sleep(1)  # let Discord register us in the channel first
+    try:
+        if not voice.is_connected() or voice.is_playing():
+            return  # a song already started; it handles speaking itself
+        await voice.ws.speak(discord.SpeakingState.none)
+        for _ in range(5):
+            voice.send_audio_packet(discord.opus.OPUS_SILENCE, encode=False)
+    except Exception:
+        pass  # purely cosmetic — never break voice over it
+
+
 async def ensure_voice(message: discord.Message):
     # Make sure the user is in a voice channel and the bot is connected to it.
     # Returns the voice client, or None (after messaging) if we can't join.
@@ -347,6 +401,8 @@ async def ensure_voice(message: discord.Message):
     voice = message.guild.voice_client
     if voice is None:
         voice = await channel.connect()
+        # In the background, so a play command doesn't wait on it.
+        _run_in_background(_clear_speaking_ring(voice))
     elif voice.channel != channel:
         await voice.move_to(channel)
     return voice
@@ -558,11 +614,145 @@ async def show_queue(message: discord.Message):
     await message.channel.send("\n".join(lines)[:2000])
 
 
-async def leave_voice(message: discord.Message):
+async def stop_music(message: discord.Message):
+    # End playback and empty the queue, but STAY in the channel (leaving is
+    # `syntia leave`). If nothing starts again, the idle timeout takes over.
     voice = message.guild.voice_client
-    if voice is None:
+    if voice is None or not (voice.is_playing() or voice.is_paused()):
+        await message.channel.send("Nothing is playing.")
+        return
+    player = get_player(message.guild.id)
+    player.queue.clear()
+    player.seek_target = None  # a pending seek must not restart the track
+    # Stopping fires the after-callback: play_next files the song into history
+    # (so `previous` still works) and finds an empty queue, so it goes quiet.
+    voice.stop()
+    await message.channel.send("⏹️ Stopped. I'll hang around here.")
+
+
+async def disconnect(guild: discord.Guild):
+    # Shared by `stop` and the idle timeout. Forget the player FIRST: disconnecting
+    # fires the after-callback, which then finds nothing to "recover".
+    voice = guild.voice_client
+    players.pop(guild.id, None)  # forget queue, history, and current
+    idle_since.pop(guild.id, None)
+    if voice is not None:
+        await voice.disconnect()
+
+
+async def leave_voice(message: discord.Message):
+    if message.guild.voice_client is None:
         await message.channel.send("I'm not in a voice channel.")
         return
-    players.pop(message.guild.id, None)  # forget queue, history, and current
-    await voice.disconnect()
+    await disconnect(message.guild)
     await message.channel.send("If you wanna be Alone then be Alone... Bye!")
+
+
+# --- Volume ------------------------------------------------------------------
+# Percent per server, kept outside GuildPlayer so it survives a leave. In memory
+# only: a restart resets every server to DEFAULT_VOLUME.
+volumes: dict[int, int] = {}
+
+
+def get_volume(guild_id: int) -> int:
+    return volumes.get(guild_id, config.DEFAULT_VOLUME)
+
+
+async def set_volume(message: discord.Message, level: str = ""):
+    # `syntia volume` shows it; `syntia volume 10` (or "10%") sets it, live.
+    guild_id = message.guild.id
+    text = str(level).strip().rstrip("%")
+    if not text:
+        await message.channel.send(f"🔊 Volume is **{get_volume(guild_id)}%**.")
+        return
+    if not text.isdigit() or int(text) > 100:
+        await message.channel.send("Give me a volume from 0 to 100, e.g. `syntia volume 10`.")
+        return
+    percent = volumes[guild_id] = int(text)
+    # Apply it to the song playing right now; later tracks read it on start.
+    voice = message.guild.voice_client
+    if voice is not None and isinstance(voice.source, discord.PCMVolumeTransformer):
+        voice.source.volume = percent / 100
+    icon = "🔇" if percent == 0 else "🔉" if percent < 50 else "🔊"
+    await message.channel.send(f"{icon} Volume set to **{percent}%**.")
+
+
+# --- Idle timeout ------------------------------------------------------------
+# Per-server settings live here (not on GuildPlayer, which is thrown away on
+# leave). In memory only: a restart resets every server to the .env default.
+timeout_settings: dict[int, dict] = {}
+# When each server's bot first went idle / was left alone (monotonic clock).
+idle_since: dict[int, float] = {}
+
+MAX_TIMEOUT_MINUTES = 240
+
+
+def get_timeout(guild_id: int) -> dict:
+    default = config.IDLE_TIMEOUT_MINUTES
+    return timeout_settings.setdefault(
+        guild_id, {"enabled": default > 0, "minutes": default if default > 0 else 5}
+    )
+
+
+async def check_idle():
+    # Polled every 30 s by bot.py. Polling (instead of hooking every playback
+    # path) means nothing slips through; a brief gap during a seek or track
+    # change just gets cleared again on the next poll.
+    now = time.monotonic()
+    for voice in list(client.voice_clients):
+        guild = voice.guild
+        setting = get_timeout(guild.id)
+        idle = not (voice.is_playing() or voice.is_paused())
+        alone = not any(not member.bot for member in voice.channel.members)
+        if not setting["enabled"] or not (idle or alone):
+            idle_since.pop(guild.id, None)
+            continue
+        since = idle_since.setdefault(guild.id, now)
+        if now - since < setting["minutes"] * 60:
+            continue
+        player = players.get(guild.id)
+        channel = player.text_channel if player else None
+        await disconnect(guild)
+        if channel is not None:
+            reason = (
+                "Everyone left, so I did too."
+                if alone
+                else f"No music for {setting['minutes']} min, heading out."
+            )
+            await channel.send(reason, silent=True)
+
+
+def _can_change_timeout(member: discord.Member) -> bool:
+    # The verified owner (by ID, like the AI's check) or a server admin.
+    is_owner = bool(config.OWNER_ID) and member.id == config.OWNER_ID
+    return is_owner or member.guild_permissions.manage_guild
+
+
+async def set_timeout(message: discord.Message, arg: str = ""):
+    # `syntia timeout` shows the setting; on / off / <minutes> change it (admins).
+    setting = get_timeout(message.guild.id)
+    arg = arg.lower()
+    if not arg:
+        state = f"on, {setting['minutes']} min" if setting["enabled"] else "off"
+        await message.channel.send(f"Idle timeout: **{state}**.")
+        return
+    if not _can_change_timeout(message.author):
+        await message.channel.send(
+            "Only the owner or someone with Manage Server can change the timeout."
+        )
+        return
+    if arg == "off":
+        setting["enabled"] = False
+        idle_since.pop(message.guild.id, None)
+        await message.channel.send("Idle timeout **off** - I'll stay until told to leave.")
+    elif arg == "on":
+        setting["enabled"] = True
+        await message.channel.send(f"Idle timeout **on** ({setting['minutes']} min).")
+    elif arg.isdigit() and 1 <= int(arg) <= MAX_TIMEOUT_MINUTES:
+        setting["enabled"] = True
+        setting["minutes"] = int(arg)
+        await message.channel.send(f"Idle timeout **on** ({arg} min).")
+    else:
+        await message.channel.send(
+            f"Use `syntia timeout on`, `off`, or a number of minutes (1-{MAX_TIMEOUT_MINUTES})."
+        )
