@@ -180,6 +180,20 @@ SPOTIFY_CLIENT_SECRET=
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ```
 
+## Running the tests
+
+The `tests/` folder checks the bot's logic with small fake Discord objects —
+no token, server, or voice connection needed, and it finishes in about a second.
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt   # once
+.venv\Scripts\python.exe -m pytest
+```
+
+One test plays a generated tone through FFmpeg to check the volume math; it's
+skipped automatically if FFmpeg isn't installed. When you add a command, the
+suite also fails if you forget to list it in `help_text.py`.
+
 ## Reinstalling dependencies later
 
 ```powershell
