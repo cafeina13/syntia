@@ -31,6 +31,15 @@ OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 # Our custom "caller" — type this (then a command) in chat to talk to the bot.
 PREFIX = "syntia "
 
+# Leave voice after this many minutes with no music (or nobody listening).
+# Each server can change it at runtime with `syntia timeout`; a restart resets
+# it to this value. 0 = off by default.
+IDLE_TIMEOUT_MINUTES = int(os.getenv("IDLE_TIMEOUT_MINUTES") or 5)
+
+# Playback volume in percent (0-100) that each server starts at. `syntia volume`
+# changes it per server until the next restart.
+DEFAULT_VOLUME = max(0, min(100, int(os.getenv("DEFAULT_VOLUME") or 100)))
+
 # Which AI backend to use: "gemini" (cloud, free tier) or "ollama" (local).
 # Ollama is great for offline testing — no rate limits.
 AI_BACKEND = os.getenv("AI_BACKEND", "gemini").lower()

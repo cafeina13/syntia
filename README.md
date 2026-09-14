@@ -72,30 +72,40 @@ AI_BACKEND=gemini        # "gemini" (cloud) or "ollama" (local)
 The bot's personality and rules live in **`System_Prompt.md`** — edit that to
 change how the AI behaves (restart to apply).
 
-### 6. Spotify (optional — only for Spotify links)
+### 6. Spotify (fully optional)
+
+**Spotify links work with no setup at all.** For any *public* playlist, album, or
+track, the bot reads the track list off Spotify's public embed page and searches
+each song on YouTube. No credentials, no login.
+
+Adding a Spotify app only buys you one thing: **no track cap**. The embed page
+returns a limited slice of a long playlist (50–100 tracks, varies), while the
+official API returns all of it. Set it up only if you queue playlists longer
+than that:
 
 1. Create a free app at <https://developer.spotify.com/dashboard>. For the
    Redirect URI use `http://127.0.0.1:8888/callback` (use `127.0.0.1`, not
    `localhost`). Copy the **Client ID** and **Client Secret** into `.env`.
-2. Reading playlists needs a one-time login (Spotify blocks playlists for
-   app-only tokens). Run it once:
+2. Log in once so the bot can read playlists with your account:
    ```powershell
    .venv\Scripts\python.exe spotify_login.py
    ```
    A browser opens; approve, and a token is cached to `.spotify_cache`.
-3. Note: in Spotify "Development Mode" you can reliably read **playlists owned by
-   the logged-in account**; other people's playlists may be blocked.
+3. In Spotify "Development Mode" the API reliably reads **playlists owned by the
+   logged-in account**. Other people's playlists usually come back 403/404 —
+   that's fine, the bot just falls back to the embed page automatically.
+
+Note the embed fallback depends on the layout of Spotify's public pages, so it
+can break if they change them. If Spotify links suddenly stop resolving, that's
+the first place to look.
 
 ## Run it
-
-Either:
 
 ```powershell
 .venv\Scripts\python.exe bot.py
 ```
 
-…or just **double-click `start_syntia.bat`**. Keep the window open while the bot
-runs; close it (or `Ctrl+C`) to stop.
+Keep the window open while the bot runs; close it (or `Ctrl+C`) to stop.
 
 > The bot only runs while this machine is on — there's no cloud server.
 
@@ -114,16 +124,31 @@ Type these in any text channel (you must be in a voice channel for music):
 | `syntia forward [N]` (or `fwd` / `ff`) | Jump ahead N seconds in the current track (default 30) |
 | `syntia rewind [N]` (or `rw`) | Jump back N seconds (default 30) |
 | `syntia seek <time>` | Jump to a position, e.g. `syntia seek 1:02:00` |
+| `syntia volume [0-100]` (or `vol`) | Show or set the volume for everyone, e.g. `syntia volume 10` (applies instantly) |
 | `syntia shuffle` | Shuffle the queue |
 | `syntia shuffle <playlist>` | Load a playlist and shuffle-play it |
-| `syntia stop` (or `leave` / `bye`) | Stop and leave the voice channel |
+| `syntia stop` | Stop the music and clear the queue, but stay in the channel |
+| `syntia leave` (or `bye` / `disconnect`) | Leave the voice channel |
+| `syntia join` (or `come` / `summon`) | Join your voice channel without playing anything |
+| `syntia timeout` | Show the idle auto-leave setting |
+| `syntia timeout on` / `off` / `<minutes>` | Change it (owner or Manage Server only) |
 | `syntia roll [N]` | Roll a dice (1–N, default 6) |
+| `syntia help` (or `commands`) | List all commands |
 | `syntia <anything else>` | Talk to the AI (it may also start music) |
 
 `<…>` can be a search ("lofi hip hop"), a YouTube / YouTube Music / Spotify link,
 or a playlist link.
 
-Slash commands also exist: `/ping`, `/hello`, `/echo`.
+If you mistype a command, the AI points you to the right one (or sends the help
+list). The command list itself lives in `help_text.py` — the help command, `/help`,
+and the AI all read from it.
+
+**Idle timeout:** the bot leaves voice after a few minutes (default 5) with no
+music playing, or with nobody left in the channel. Set the default with
+`IDLE_TIMEOUT_MINUTES` in `.env` (`0` = off); `syntia timeout` changes it per
+server until the next restart.
+
+Slash commands also exist: `/help`, `/ping`, `/hello`, `/echo`.
 
 ## Project layout
 
@@ -133,9 +158,9 @@ Slash commands also exist: `/ping`, `/hello`, `/echo`.
 | `config.py` | Settings + the Gemini / Ollama / Spotify clients (reads `.env`) |
 | `music.py` | Voice playback, the queue, and resolving audio from YouTube/Spotify |
 | `ai.py` | AI tools, the Gemini/Ollama backends, and the chat dispatcher |
+| `help_text.py` | The command list behind `syntia help`, `/help`, and the AI prompt |
 | `System_Prompt.md` | The AI's personality and rules (plain Markdown) |
 | `spotify_login.py` | One-time Spotify login helper |
-| `start_syntia.bat` | Double-click launcher |
 | `.env` | Your secrets (gitignored — never commit) |
 | `.env.example` | Template for `.env` |
 
@@ -145,10 +170,12 @@ Slash commands also exist: `/ping`, `/hello`, `/echo`.
 DISCORD_TOKEN=        # required — your bot token
 GUILD_ID=             # optional — your server ID for instant slash-command updates
 OWNER_ID=0            # optional — your Discord user ID; the AI treats it as the verified owner
+IDLE_TIMEOUT_MINUTES=5  # leave voice after N quiet minutes; 0 = off by default
+DEFAULT_VOLUME=100      # starting playback volume in percent (0-100)
 AI_BACKEND=gemini     # "gemini" or "ollama"
 GEMINI_API_KEY=       # needed if AI_BACKEND=gemini
 OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M   # used if AI_BACKEND=ollama
-SPOTIFY_CLIENT_ID=    # optional — for Spotify links
+SPOTIFY_CLIENT_ID=    # optional — only to lift the track cap on long playlists
 SPOTIFY_CLIENT_SECRET=
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ```

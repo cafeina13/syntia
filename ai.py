@@ -8,6 +8,7 @@ from google.genai import types
 
 import config
 import music
+from help_text import command_reference, help_message
 
 
 def build_system_instruction(message: discord.Message) -> str:
@@ -19,11 +20,17 @@ def build_system_instruction(message: discord.Message) -> str:
         f"{config.AI_PRE_PROMPT}\n\n"
         f"### Current Context\n"
         f"- The user you are talking to is named: {user_name}\n"
-        f"- Server: {server_name}\n\n"
+        f"- Server: {server_name}\n"
+        f"- Current music volume: "
+        f"{music.get_volume(message.guild.id) if message.guild else 100}%\n\n"
         f"You can play or stop music in the user's voice channel by calling your "
         f"available tools whenever they want to listen to or stop something. "
         f"If a message is clearly a song, artist, or playlist, play it instead of "
-        f"replying with text."
+        f"replying with text.\n\n"
+        f"### Bot Commands\n"
+        f"These are the exact chat commands users can type. Use them when "
+        f"pointing someone to the right command:\n"
+        f"{command_reference()}"
     )
     # Verified owner: matched by Discord ID (which cannot be faked), never by name.
     # Only the real owner ever sees this block, so it's safe to grant privileges.
@@ -82,7 +89,19 @@ TOOL_SPECS = [
     },
     {
         "name": "stop_music",
-        "description": "Stop playback and leave the voice channel.",
+        "description": (
+            "Stop the music and clear the queue, but STAY in the voice channel. "
+            "Use for 'stop', 'stop the music', 'enough music'."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    {
+        "name": "leave_voice",
+        "description": (
+            "Stop everything and LEAVE the voice channel. Use for 'leave', "
+            "'disconnect', 'get out', 'bye'."
+        ),
         "properties": {},
         "required": [],
     },
@@ -122,6 +141,37 @@ TOOL_SPECS = [
                 "Absolute position to jump TO, in seconds from the start of the track.",
             ),
         },
+        "required": [],
+    },
+    {
+        "name": "set_volume",
+        "description": (
+            "Set the playback volume for everyone, 0-100 percent. The current "
+            "volume is in your context, so 'turn it down a bit' can be worked out "
+            "from it (e.g. 50 -> 35). Use for 'volume 10', 'quieter', 'louder'."
+        ),
+        "properties": {
+            "level": ("integer", "The new volume in percent, from 0 to 100."),
+        },
+        "required": ["level"],
+    },
+    {
+        "name": "join_voice",
+        "description": (
+            "Join the user's voice channel WITHOUT playing anything. Use for "
+            "'join', 'come here', 'get in voice'."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    {
+        "name": "show_help",
+        "description": (
+            "Send the full list of Syntia's commands. Use when the user asks what "
+            "you can do or how to use you, or sent a broken command you can't "
+            "figure out."
+        ),
+        "properties": {},
         "required": [],
     },
 ]
@@ -230,6 +280,8 @@ async def run_tool(message: discord.Message, name: str, args: dict):
     elif name == "clear_queue":
         await music.clear_queue(message)
     elif name == "stop_music":
+        await music.stop_music(message)
+    elif name == "leave_voice":
         await music.leave_voice(message)
     elif name == "skip_song":
         await music.skip_song(message)
@@ -246,6 +298,13 @@ async def run_tool(message: discord.Message, name: str, args: dict):
             int(args.get("seconds") or 0),
             int(to) if to is not None else None,
         )
+    elif name == "set_volume":
+        level = max(0, min(100, int(args.get("level") or 0)))
+        await music.set_volume(message, str(level))
+    elif name == "join_voice":
+        await music.join_voice(message)
+    elif name == "show_help":
+        await message.channel.send(help_message())
 
 
 async def ask_ai(message: discord.Message, prompt: str):

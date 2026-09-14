@@ -5,9 +5,11 @@ these functions; the AI reaches them via ai.run_tool.
 """
 
 import asyncio
+import json
 import random
 import re
 import time
+import urllib.request
 
 import discord
 import yt_dlp
@@ -55,11 +57,20 @@ class GuildPlayer:
         self.offset = 0  # seconds into the track where the current source began
         self.started_at = 0.0  # monotonic clock time when the current source began
         self.seek_target = None  # (entry, seconds) set by seek() so play_next replays it
+        # Set while playing so we can find our way back after a dropped
+        # connection: where we were speaking, and where we were announcing.
+        self.voice_channel_id = None
+        self.text_channel = None
+        self.interrupted = False  # True once voice died with tracks still queued
+        self.resume_attempts = 0  # give up after MAX_RESUME_ATTEMPTS in a row
 
     def position(self) -> float:
         # How many seconds into the current track we are right now.
         return self.offset + (time.monotonic() - self.started_at)
 
+
+# A flapping connection shouldn't have us reconnecting forever.
+MAX_RESUME_ATTEMPTS = 3
 
 players: dict[int, GuildPlayer] = {}
 
@@ -103,15 +114,27 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
     player = get_player(guild.id)
     player.current = entry
     player.offset = int(offset)
-    source = await discord.FFmpegOpusAudio.from_probe(
-        stream_url, **ffmpeg_options(int(offset))
+    # Breadcrumbs for resume_after_reconnect(): the voice channel to rejoin and
+    # the text channel to speak in. A clean start also clears the retry budget.
+    player.voice_channel_id = voice.channel.id
+    player.text_channel = entry["channel"]
+    player.resume_attempts = 0
+    # Decode to raw PCM and wrap it in a volume transformer, so the volume can
+    # change live mid-song. (Passing Opus straight through is cheaper, but its
+    # loudness can't be touched.)
+    source = discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(stream_url, **ffmpeg_options(int(offset))),
+        volume=get_volume(guild.id) / 100,
     )
     # after=... runs when THIS song finishes -> kick off the next one.
     voice.play(source, after=lambda error: schedule_next(guild))
     player.started_at = time.monotonic()  # start the position clock
     if announce:
         note = f" (from {int(offset) // 60}:{int(offset) % 60:02d})" if offset else ""
-        await entry["channel"].send(f"▶️ Now playing: **{title}**{note}")
+        # silent=True -> the message still posts, but Discord skips the push
+        # notification. This one fires on its own at every track change, so a
+        # ping per song in a long queue gets old fast.
+        await entry["channel"].send(f"▶️ Now playing: **{title}**{note}", silent=True)
     return True
 
 
@@ -119,6 +142,9 @@ async def play_next(guild: discord.Guild):
     player = get_player(guild.id)
     voice = guild.voice_client
     if voice is None:
+        # Voice went away under us — a gateway reconnect, a kick, or a network
+        # drop. Park the queue and say so instead of going quiet.
+        await _handle_voice_loss(guild, player)
         return
     # A seek is in progress? Replay the SAME track at the new position, WITHOUT
     # touching history or the queue.
@@ -138,6 +164,71 @@ async def play_next(guild: discord.Guild):
             return
 
 
+async def _handle_voice_loss(guild: discord.Guild, player: GuildPlayer):
+    # Called when the after-callback fires but we're no longer in voice. Push the
+    # track that was playing back to the FRONT of the queue, tagged with how far
+    # we got, so a resume picks up mid-song rather than restarting it.
+    if player.interrupted:
+        return  # already parked — don't announce the same drop twice
+    if player.current is None and not player.queue:
+        return  # nothing was going on; nothing to mourn
+    if player.current is not None:
+        entry = player.current
+        entry["start_seconds"] = max(0, int(player.position()))
+        player.queue.insert(0, entry)
+        player.current = None
+    player.interrupted = True
+    if player.text_channel is not None:
+        await player.text_channel.send(
+            f"🔌 Lost the voice connection. Queue is paused with "
+            f"**{len(player.queue)}** track(s) left — I'll pick it up "
+            "automatically if I get back in.",
+            silent=True,
+        )
+
+
+async def resume_after_reconnect(guild: discord.Guild):
+    # Called after the gateway comes back. Rejoins the channel we were in and
+    # restarts the queue. No-op unless _handle_voice_loss() flagged this guild.
+    player = players.get(guild.id)
+    if player is None or not player.interrupted:
+        return
+    if not player.queue or player.voice_channel_id is None:
+        player.interrupted = False
+        return
+    if player.resume_attempts >= MAX_RESUME_ATTEMPTS:
+        return  # stay parked; a manual play command still works
+    player.resume_attempts += 1
+    channel = guild.get_channel(player.voice_channel_id)
+    if channel is None:  # channel deleted, or we can't see it any more
+        player.interrupted = False
+        return
+    await asyncio.sleep(2)  # let the fresh gateway session settle before voice
+    try:
+        if guild.voice_client is None:
+            voice = await channel.connect()
+            _run_in_background(_clear_speaking_ring(voice))
+        else:
+            await guild.voice_client.move_to(channel)
+    except Exception:
+        return  # leave the flag set so the next reconnect tries again
+    player.interrupted = False
+    if player.text_channel is not None:
+        await player.text_channel.send(
+            "🔁 Back online — picking up where I left off.", silent=True
+        )
+    await play_next(guild)
+
+
+async def recover_all():
+    # Fired from bot.py on every (re)connect. Guilds we were never playing in
+    # skip out immediately via the interrupted flag.
+    for guild_id in list(players):
+        guild = client.get_guild(guild_id)
+        if guild is not None:
+            await resume_after_reconnect(guild)
+
+
 def _spotify_query(track: dict) -> str:
     # Turn a Spotify track into a YouTube search string, e.g. "Queen - Bohemian Rhapsody".
     if not track:
@@ -148,14 +239,26 @@ def _spotify_query(track: dict) -> str:
 
 
 def spotify_tracks(url: str) -> list:
-    # Read a Spotify track / playlist / album link and return YouTube search
-    # strings. Blocking (network), so callers run it via asyncio.to_thread.
+    # Read a Spotify track / playlist / album link -> YouTube search strings.
+    # Blocking (network), so callers run it via asyncio.to_thread.
+    # Prefer the official API (full list, no cap) when we have a login; otherwise
+    # — or for playlists the API can't read, like other people's — scrape the
+    # public embed page.
     match = re.search(r"open\.spotify\.com/(playlist|track|album)/([A-Za-z0-9]+)", url)
     if not match:
         return []
     kind, spotify_id = match.group(1), match.group(2)
-    searches = []
+    if config.spotify_client is not None:
+        try:
+            return _spotify_tracks_api(kind, spotify_id)
+        except Exception:
+            pass  # e.g. someone else's playlist (403) -> fall back to scraping
+    return _scrape_spotify(kind, spotify_id)
 
+
+def _spotify_tracks_api(kind: str, spotify_id: str) -> list:
+    # Official-API path (needs a login). Full track list, no ~100 cap.
+    searches = []
     if kind == "track":
         searches.append(_spotify_query(config.spotify_client.track(spotify_id)))
     elif kind == "playlist":
@@ -171,8 +274,43 @@ def spotify_tracks(url: str) -> list:
             for track in page["items"]:
                 searches.append(_spotify_query(track))
             page = config.spotify_client.next(page) if page.get("next") else None
-
     return [search for search in searches if search]  # drop any empties
+
+
+def _find_tracklist(obj):
+    # Recursively find the "trackList" array inside the embed page's JSON.
+    if isinstance(obj, dict):
+        if isinstance(obj.get("trackList"), list):
+            return obj["trackList"]
+        for value in obj.values():
+            found = _find_tracklist(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_tracklist(value)
+            if found:
+                return found
+    return None
+
+
+def _scrape_spotify(kind: str, spotify_id: str) -> list:
+    # No-API fallback: the public embed page ships the track list as JSON. Works
+    # for any PUBLIC item, but caps at ~100 tracks and can break if Spotify
+    # changes their page. ToS gray area — fine for a personal bot.
+    embed = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
+    request = urllib.request.Request(embed, headers={"User-Agent": "Mozilla/5.0"})
+    html = urllib.request.urlopen(request, timeout=20).read().decode("utf-8", "replace")
+    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not match:
+        return []
+    tracklist = _find_tracklist(json.loads(match.group(1))) or []
+    searches = []
+    for track in tracklist:
+        query = f"{track.get('subtitle', '')} - {track.get('title', '')}".strip(" -")
+        if query:
+            searches.append(query)
+    return searches
 
 
 def is_spotify_url(text: str) -> bool:
@@ -204,6 +342,55 @@ def youtube_playlist_entries(url: str) -> list:
     return out
 
 
+async def join_voice(message: discord.Message):
+    # Join the user's voice channel WITHOUT playing anything (debugging, and a
+    # base for future voice features). The idle timeout still applies.
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("Join a voice channel first, then try again.")
+        return
+    channel = message.author.voice.channel
+    voice = message.guild.voice_client
+    if voice is not None and voice.channel == channel:
+        await message.channel.send("I'm already here.")
+        return
+    try:
+        voice = await ensure_voice(message)
+    except Exception as error:
+        await message.channel.send(f"Couldn't join **{channel.name}**: {error}")
+        return
+    # Remember where we are, so the idle timeout knows where to say goodbye.
+    player = get_player(message.guild.id)
+    player.voice_channel_id = voice.channel.id
+    player.text_channel = message.channel
+    await message.channel.send(f"Joined **{voice.channel.name}**.")
+
+
+# asyncio only keeps weak references to tasks, so hold on to them until done.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _run_in_background(coro):
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _clear_speaking_ring(voice: discord.VoiceClient):
+    # A freshly connected bot shows a stuck green "speaking" ring until it sends
+    # some audio: the "not speaking" signal from the handshake alone doesn't
+    # clear it. Stopping a song clears it by sending a few silent frames, so we
+    # do the same right after connecting.
+    await asyncio.sleep(1)  # let Discord register us in the channel first
+    try:
+        if not voice.is_connected() or voice.is_playing():
+            return  # a song already started; it handles speaking itself
+        await voice.ws.speak(discord.SpeakingState.none)
+        for _ in range(5):
+            voice.send_audio_packet(discord.opus.OPUS_SILENCE, encode=False)
+    except Exception:
+        pass  # purely cosmetic — never break voice over it
+
+
 async def ensure_voice(message: discord.Message):
     # Make sure the user is in a voice channel and the bot is connected to it.
     # Returns the voice client, or None (after messaging) if we can't join.
@@ -214,6 +401,8 @@ async def ensure_voice(message: discord.Message):
     voice = message.guild.voice_client
     if voice is None:
         voice = await channel.connect()
+        # In the background, so a play command doesn't wait on it.
+        _run_in_background(_clear_speaking_ring(voice))
     elif voice.channel != channel:
         await voice.move_to(channel)
     return voice
@@ -227,12 +416,6 @@ async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
     queue = get_player(message.guild.id).queue
 
     if is_spotify_url(query):
-        if config.spotify_client is None:
-            await message.channel.send(
-                "Spotify playlists need a one-time login. Set SPOTIFY_CLIENT_ID/"
-                "SECRET in .env, run `python spotify_login.py` once, then restart me."
-            )
-            return 0
         async with message.channel.typing():
             try:
                 searches = await asyncio.to_thread(spotify_tracks, query)
@@ -240,7 +423,7 @@ async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
                 await message.channel.send(f"Couldn't read that Spotify link: {error}")
                 return 0
         if not searches:
-            await message.channel.send("That Spotify link had no playable tracks.")
+            await message.channel.send("Couldn't get any tracks from that Spotify link.")
             return 0
         for search in searches:
             queue.append({"query": search, "title": search,
@@ -431,11 +614,145 @@ async def show_queue(message: discord.Message):
     await message.channel.send("\n".join(lines)[:2000])
 
 
-async def leave_voice(message: discord.Message):
+async def stop_music(message: discord.Message):
+    # End playback and empty the queue, but STAY in the channel (leaving is
+    # `syntia leave`). If nothing starts again, the idle timeout takes over.
     voice = message.guild.voice_client
-    if voice is None:
+    if voice is None or not (voice.is_playing() or voice.is_paused()):
+        await message.channel.send("Nothing is playing.")
+        return
+    player = get_player(message.guild.id)
+    player.queue.clear()
+    player.seek_target = None  # a pending seek must not restart the track
+    # Stopping fires the after-callback: play_next files the song into history
+    # (so `previous` still works) and finds an empty queue, so it goes quiet.
+    voice.stop()
+    await message.channel.send("⏹️ Stopped. I'll hang around here.")
+
+
+async def disconnect(guild: discord.Guild):
+    # Shared by `stop` and the idle timeout. Forget the player FIRST: disconnecting
+    # fires the after-callback, which then finds nothing to "recover".
+    voice = guild.voice_client
+    players.pop(guild.id, None)  # forget queue, history, and current
+    idle_since.pop(guild.id, None)
+    if voice is not None:
+        await voice.disconnect()
+
+
+async def leave_voice(message: discord.Message):
+    if message.guild.voice_client is None:
         await message.channel.send("I'm not in a voice channel.")
         return
-    players.pop(message.guild.id, None)  # forget queue, history, and current
-    await voice.disconnect()
+    await disconnect(message.guild)
     await message.channel.send("If you wanna be Alone then be Alone... Bye!")
+
+
+# --- Volume ------------------------------------------------------------------
+# Percent per server, kept outside GuildPlayer so it survives a leave. In memory
+# only: a restart resets every server to DEFAULT_VOLUME.
+volumes: dict[int, int] = {}
+
+
+def get_volume(guild_id: int) -> int:
+    return volumes.get(guild_id, config.DEFAULT_VOLUME)
+
+
+async def set_volume(message: discord.Message, level: str = ""):
+    # `syntia volume` shows it; `syntia volume 10` (or "10%") sets it, live.
+    guild_id = message.guild.id
+    text = str(level).strip().rstrip("%")
+    if not text:
+        await message.channel.send(f"🔊 Volume is **{get_volume(guild_id)}%**.")
+        return
+    if not text.isdigit() or int(text) > 100:
+        await message.channel.send("Give me a volume from 0 to 100, e.g. `syntia volume 10`.")
+        return
+    percent = volumes[guild_id] = int(text)
+    # Apply it to the song playing right now; later tracks read it on start.
+    voice = message.guild.voice_client
+    if voice is not None and isinstance(voice.source, discord.PCMVolumeTransformer):
+        voice.source.volume = percent / 100
+    icon = "🔇" if percent == 0 else "🔉" if percent < 50 else "🔊"
+    await message.channel.send(f"{icon} Volume set to **{percent}%**.")
+
+
+# --- Idle timeout ------------------------------------------------------------
+# Per-server settings live here (not on GuildPlayer, which is thrown away on
+# leave). In memory only: a restart resets every server to the .env default.
+timeout_settings: dict[int, dict] = {}
+# When each server's bot first went idle / was left alone (monotonic clock).
+idle_since: dict[int, float] = {}
+
+MAX_TIMEOUT_MINUTES = 240
+
+
+def get_timeout(guild_id: int) -> dict:
+    default = config.IDLE_TIMEOUT_MINUTES
+    return timeout_settings.setdefault(
+        guild_id, {"enabled": default > 0, "minutes": default if default > 0 else 5}
+    )
+
+
+async def check_idle():
+    # Polled every 30 s by bot.py. Polling (instead of hooking every playback
+    # path) means nothing slips through; a brief gap during a seek or track
+    # change just gets cleared again on the next poll.
+    now = time.monotonic()
+    for voice in list(client.voice_clients):
+        guild = voice.guild
+        setting = get_timeout(guild.id)
+        idle = not (voice.is_playing() or voice.is_paused())
+        alone = not any(not member.bot for member in voice.channel.members)
+        if not setting["enabled"] or not (idle or alone):
+            idle_since.pop(guild.id, None)
+            continue
+        since = idle_since.setdefault(guild.id, now)
+        if now - since < setting["minutes"] * 60:
+            continue
+        player = players.get(guild.id)
+        channel = player.text_channel if player else None
+        await disconnect(guild)
+        if channel is not None:
+            reason = (
+                "Everyone left, so I did too."
+                if alone
+                else f"No music for {setting['minutes']} min, heading out."
+            )
+            await channel.send(reason, silent=True)
+
+
+def _can_change_timeout(member: discord.Member) -> bool:
+    # The verified owner (by ID, like the AI's check) or a server admin.
+    is_owner = bool(config.OWNER_ID) and member.id == config.OWNER_ID
+    return is_owner or member.guild_permissions.manage_guild
+
+
+async def set_timeout(message: discord.Message, arg: str = ""):
+    # `syntia timeout` shows the setting; on / off / <minutes> change it (admins).
+    setting = get_timeout(message.guild.id)
+    arg = arg.lower()
+    if not arg:
+        state = f"on, {setting['minutes']} min" if setting["enabled"] else "off"
+        await message.channel.send(f"Idle timeout: **{state}**.")
+        return
+    if not _can_change_timeout(message.author):
+        await message.channel.send(
+            "Only the owner or someone with Manage Server can change the timeout."
+        )
+        return
+    if arg == "off":
+        setting["enabled"] = False
+        idle_since.pop(message.guild.id, None)
+        await message.channel.send("Idle timeout **off** - I'll stay until told to leave.")
+    elif arg == "on":
+        setting["enabled"] = True
+        await message.channel.send(f"Idle timeout **on** ({setting['minutes']} min).")
+    elif arg.isdigit() and 1 <= int(arg) <= MAX_TIMEOUT_MINUTES:
+        setting["enabled"] = True
+        setting["minutes"] = int(arg)
+        await message.channel.send(f"Idle timeout **on** ({arg} min).")
+    else:
+        await message.channel.send(
+            f"Use `syntia timeout on`, `off`, or a number of minutes (1-{MAX_TIMEOUT_MINUTES})."
+        )

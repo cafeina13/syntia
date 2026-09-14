@@ -1,4 +1,4 @@
-r"""
+"""
 Syntia — a learning Discord bot (entry point).
 
 This file wires Discord events to the feature modules:
@@ -6,17 +6,19 @@ This file wires Discord events to the feature modules:
   music.py   — voice playback, queue, source resolution
   ai.py      — AI brain: tools, Gemini/Ollama backends, dispatch
 
-Run it with:  .venv\Scripts\python.exe bot.py
+Run it with:  .venv\\Scripts\\python.exe bot.py
 """
 
 import random
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 import ai
 import music
 from config import GUILD_ID, PREFIX, TOKEN
+from help_text import help_message
 
 # "Intents" tell Discord which events the bot receives. To read chat messages
 # (needed for our "syntia ..." prefix), we turn on the PRIVILEGED message content
@@ -32,8 +34,9 @@ class SyntiaBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # Runs once before the bot connects. Syncing pushes your slash commands
-        # up to Discord so they appear in the / menu.
+        # Runs once before the bot connects. Start the idle-timeout watcher, then
+        # sync: syncing pushes your slash commands up to Discord for the / menu.
+        idle_watcher.start()
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             # Copy global commands onto this one guild, then sync just it.
@@ -50,6 +53,21 @@ class SyntiaBot(discord.Client):
             )
 
 
+@tasks.loop(seconds=30)
+async def idle_watcher():
+    # Leaves voice channels that have gone quiet (see music.check_idle).
+    try:
+        await music.check_idle()
+    except Exception as error:
+        # An exception would stop the loop for good — log it and keep watching.
+        print(f"Idle check failed: {error}")
+
+
+@idle_watcher.before_loop
+async def before_idle_watcher():
+    await client.wait_until_ready()
+
+
 client = SyntiaBot()
 # Give the music module the client, so its playback callbacks can reach the loop.
 music.client = client
@@ -57,9 +75,18 @@ music.client = client
 
 @client.event
 async def on_ready():
-    # Fires when the bot has finished logging in.
+    # Fires when the bot has finished logging in — including AGAIN after a
+    # dropped session had to re-IDENTIFY, which is why we try to resume here.
     print(f"Logged in as {client.user} (id: {client.user.id})")
     print("Bot is ready! Try /ping, or type 'syntia roll 20' in chat.")
+    await music.recover_all()
+
+
+@client.event
+async def on_resumed():
+    # A briefer hiccup: the session survived, so Discord let us RESUME. Voice
+    # may still have been dropped, so give the queue the same chance to recover.
+    await music.recover_all()
 
 
 @client.event
@@ -76,7 +103,7 @@ async def on_message(message: discord.Message):
 
     # Remove the prefix, then split the rest into a command word + its arguments.
     # "syntia roll 20"  ->  command = "roll", args = ["20"]
-    body = message.content[len(PREFIX):].strip()
+    body = message.content[len(PREFIX) :].strip()
     parts = body.split()
     if not parts:
         return
@@ -120,7 +147,11 @@ async def on_message(message: discord.Message):
         case "clear":
             await music.clear_queue(message)
 
-        case "stop" | "leave" | "bye":
+        case "stop":
+            # End the music but stay in the channel.
+            await music.stop_music(message)
+
+        case "leave" | "bye" | "disconnect":
             # One case can match several words with the | (or) pattern.
             await music.leave_voice(message)
 
@@ -155,6 +186,19 @@ async def on_message(message: discord.Message):
         case "previous" | "prev" | "back":
             await music.play_previous(message)
 
+        case "join" | "come" | "summon":
+            # Join voice without playing anything.
+            await music.join_voice(message)
+
+        case "timeout":
+            await music.set_timeout(message, args[0] if args else "")
+
+        case "volume" | "vol":
+            await music.set_volume(message, args[0] if args else "")
+
+        case "help" | "commands":
+            await message.channel.send(help_message())
+
         case _:
             # Nothing matched — maybe a typo, maybe they just want to chat.
             # Hand the FULL text (command word included) to the AI assistant.
@@ -164,11 +208,18 @@ async def on_message(message: discord.Message):
 # --- Slash commands -------------------------------------------------------
 # Each function below is a slash command. The @decorator registers it.
 
+
 @client.tree.command(name="ping", description="Check that the bot is alive.")
 async def ping(interaction: discord.Interaction):
     # interaction.response.send_message replies to the person who ran it.
     latency_ms = round(client.latency * 1000)
     await interaction.response.send_message(f"Pong! ({latency_ms}ms)")
+
+
+@client.tree.command(name="help", description="List Syntia's commands.")
+async def help_command(interaction: discord.Interaction):
+    # ephemeral=True -> only the person who asked sees it; no channel clutter.
+    await interaction.response.send_message(help_message(), ephemeral=True)
 
 
 @client.tree.command(name="hello", description="Say hello to the bot.")
@@ -185,6 +236,7 @@ async def echo(interaction: discord.Interaction, text: str):
 
 
 # --- Start the bot --------------------------------------------------------
+
 
 def main():
     if not TOKEN:
