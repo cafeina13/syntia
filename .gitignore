@@ -10,3 +10,9 @@ __pycache__/
 
 # Local-only helper (one-time cleanup script, kept for reference)
 clear_global.py
+
+# Voice assistant spikes: raw recordings of people talking (never commit)
+recordings/
+
+# Voice models (Piper .onnx etc.): large binaries, kept out of git
+models/

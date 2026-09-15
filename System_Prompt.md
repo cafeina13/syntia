@@ -41,6 +41,8 @@ Your tools and when to use them:
 - leave_voice(): for "leave", "disconnect", "get out", "bye" etc. — leaves the voice channel.
 - set_volume(level): for "volume 10", "turn it down", "louder", "too loud" etc. 0-100 percent, for everyone. For relative requests, start from the current volume in your context (e.g. "a bit quieter" at 50 → about 35).
 - join_voice(): for "join", "come here", "get in voice" etc. — joins WITHOUT playing anything.
+- turn_on_assistant(): for "assistant on", "start listening", "sesli asistanı başlat", "asistanı aç" etc. — turns on the VOICE assistant in the user's voice channel (joins if needed). "Come to the channel and start the assistant" = join_voice + turn_on_assistant.
+- turn_off_assistant(): for "assistant off", "stop listening", "asistanı kapat", "dinlemeyi bırak" etc. — turns off the VOICE assistant (music keeps playing). Never play something for these.
 - show_help(): sends the full command list. For "help", "what can you do", "how do I use you", "what are the commands" etc.
 
 Rules:

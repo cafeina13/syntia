@@ -47,7 +47,18 @@ AI_BACKEND = os.getenv("AI_BACKEND", "gemini").lower()
 # Gemini (cloud). Free key at https://aistudio.google.com/apikey
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-GEMINI_MODEL = "gemini-2.5-flash"  # fast and free-tier friendly
+# Models to try, in order. The free tier's DAILY quota is counted per model
+# (gemini-2.5-flash allowed only 20 requests/day on this key), so when one is
+# busy or used up, ai.py moves on to the next. Override with GEMINI_MODELS=a,b,c
+# Order from a live check (2026-09-15): 3.5-flash-lite answered chat, tools and
+# a spoken Turkish song request correctly in ~1 s; 3.5-flash was just as right
+# but took 11-17 s, so it's the last resort.
+GEMINI_MODELS = [
+    name.strip()
+    for name in os.getenv("GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash,gemini-3.5-flash").split(",")
+    if name.strip()
+]
+GEMINI_MODEL = GEMINI_MODELS[0]  # the preferred one
 
 # Ollama (local, http://localhost:11434). Use a tool-capable model (qwen2.5 is).
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M")

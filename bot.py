@@ -72,6 +72,19 @@ client = SyntiaBot()
 # Give the music module the client, so its playback callbacks can reach the loop.
 music.client = client
 
+# Optional voice assistant (assistant/, `syntia assistant on|off`). Only a light
+# import here — Whisper, the wake word and Piper load when someone turns it on.
+# If anything about it is missing, the music bot simply runs without it.
+try:
+    from assistant.session import AssistantManager
+
+    assistant = AssistantManager()
+    assistant.install()  # voice connections identify speakers from their first moment
+    ai.assistant = assistant  # so "syntia odaya gel ve asistanı başlat" works through the AI
+except Exception as error:
+    assistant = None
+    print(f"Voice assistant unavailable: {error}")
+
 
 @client.event
 async def on_ready():
@@ -205,6 +218,15 @@ async def on_message(message: discord.Message):
 
         case "volume" | "vol":
             await music.set_volume(message, args[0] if args else "")
+
+        case "assistant":
+            # The experimental voice assistant: "hey jarvis, ..." in voice.
+            if assistant is None:
+                await message.channel.send(
+                    "The voice assistant isn't available on this bot (see README)."
+                )
+            else:
+                await assistant.command(message, args[0] if args else "")
 
         case "help" | "commands":
             await message.channel.send(help_message())

@@ -17,7 +17,12 @@ commented — read it top to bottom to follow how each piece works.
   can reply *or* decide to run a command itself (tool calling), and points you
   to the right command when you mistype one.
 - **Switchable AI backend**: cloud **Gemini** (free tier) or local **Ollama** —
-  set by one line in `.env`.
+  set by one line in `.env`. Gemini falls back to another model when one is busy
+  or out of its free daily quota, and a slow answer shows a live status instead
+  of silence.
+- **Voice assistant** *(optional, experimental)*: say **"hey jarvis, …"** in the
+  voice channel and Syntia does it, with short spoken replies — see
+  [Voice assistant](#voice-assistant-experimental).
 - A custom `syntia ` chat prefix, a `help` command, and a few slash commands.
 
 ## Requirements
@@ -25,6 +30,8 @@ commented — read it top to bottom to follow how each piece works.
 - **Python 3.13** (3.12 also fine).
 - **FFmpeg** installed and on your PATH (it streams the audio). Check with
   `ffmpeg -version`.
+- *Only for the voice assistant:* an **NVIDIA GPU** is recommended (~1 GB of VRAM
+  for fast speech-to-text); it also works on the CPU, just slower.
 
 ## Setup
 
@@ -70,6 +77,9 @@ AI_BACKEND=gemini        # "gemini" (cloud) or "ollama" (local)
 
 - **Gemini** (recommended, simplest): get a free key at
   <https://aistudio.google.com/apikey> and set `GEMINI_API_KEY` in `.env`.
+  The free tier limits requests **per model, per day** (as low as 20/day), so the
+  bot tries several models in order and moves on when one is busy or used up
+  (`GEMINI_MODELS` in `.env` to change the list).
 - **Ollama** (local, no API key): install [Ollama](https://ollama.com), pull a
   tool-capable model (`ollama pull qwen2.5:7b-instruct-q4_K_M`), and set
   `OLLAMA_MODEL` to match. Best as a backup for when Gemini's free tier hits its
@@ -146,6 +156,7 @@ Type these in any text channel (you must be in a voice channel for music):
 | `syntia join` (or `come` / `summon`) | Join your voice channel without playing anything |
 | `syntia timeout` | Show the idle auto-leave setting |
 | `syntia timeout on` / `off` / `<minutes>` | Change it (owner or Manage Server only) |
+| `syntia assistant` / `on` / `off` | Show, start or stop the voice assistant (people in `VOICE_USER_IDS` + the owner) — also works in plain words, e.g. `syntia odaya gel ve sesli asistanı başlat` |
 | `syntia roll [N]` | Roll a dice (1–N, default 6) |
 | `syntia help` (or `commands`) | List all commands |
 | `syntia <anything else>` | Talk to the AI (it may also start music) |
@@ -166,6 +177,41 @@ server until the next restart.
 
 Slash commands also exist: `/help`, `/ping`, `/hello`, `/echo`.
 
+## Voice assistant (experimental)
+
+Talk to Syntia in the voice channel instead of typing:
+
+> **"hey jarvis, Tarkan'dan Şımarık çal"** → *"Tamam, hallediyorum."* … the song starts … *"Tarkan, Şımarık çalıyorum."*
+
+`syntia assistant on` starts listening in your voice channel, `syntia assistant off`
+stops it, and `syntia assistant` shows whether it's on. Say **"hey jarvis"** and your
+command in one breath, or say "hey jarvis", wait for the chime, then speak. It
+works for everything you could type: play, skip, volume, questions…
+
+How it works, in order:
+
+1. **Receive** your voice from Discord with our own decoder (`assistant/voice_receive.py`, including Discord's end-to-end voice encryption).
+2. **Wake word:** "hey jarvis" via openWakeWord, then record until you stop talking (`assistant/listener.py`).
+3. **Gate:** Whisper checks locally whether there was real speech, so no AI request is spent on noise (`assistant/stt.py`).
+4. **Understand:** Gemini **listens to the recording itself**, which is far better with Turkish artist and song names than a transcript, and runs Syntia's usual tools.
+5. **Speak:** short replies in a Piper voice (`assistant/tts.py`, `assistant/speaker.py`). Music dips under the voice instead of stopping. What it says lives in `assistant/phrases.py`, kept to the main actions on purpose.
+
+**Setup** (the music bot never needs any of this):
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r assistant/requirements.txt
+```
+
+In `.env`:
+- `VOICE_USER_IDS` — who may use it (the owner always can).
+- `PIPER_MODEL` — path to a Piper `.onnx` voice. Without it, replies are text-only.
+- `STT_DEVICE` — `cuda` (fast, ~1 GB of VRAM) or `cpu` (keeps the GPU free, ~3 s per command).
+
+**Good to know:**
+- **Resources:** models load on `on` and unload on `off`, which frees the VRAM for games. The idle timeout still applies (`syntia timeout off` to keep it around), and the assistant switches itself off whenever the bot leaves voice.
+- **Privacy:** only the listed users' audio is ever decoded. Nothing is saved. After a wake word, that command clip is sent to Gemini to be understood.
+- **Noise:** loud fans or background noise can hide the wake word. Discord's own noise suppression (Krisp) helps a lot.
+
 ## Project layout
 
 | File | What's in it |
@@ -177,10 +223,13 @@ Slash commands also exist: `/help`, `/ping`, `/hello`, `/echo`.
 | `help_text.py` | The command list behind `syntia help`, `/help`, and the AI prompt |
 | `System_Prompt.md` | The AI's personality and rules (plain Markdown) |
 | `spotify_login.py` | One-time Spotify login helper |
+| `assistant/` | The optional voice assistant (see above), plus `spikes/` — the experiments it grew from |
+| `assistant/requirements.txt` | Extra packages for the voice assistant (Whisper, openWakeWord, Piper, cuBLAS) |
 | `tests/` | Offline test suite (see [Running the tests](#running-the-tests)) |
 | `pytest.ini` | Test runner settings |
 | `requirements.txt` | What the bot needs to run |
 | `requirements-dev.txt` | Extra packages for running the tests |
+| `models/`, `recordings/` | Voice models and debug recordings (gitignored, local only) |
 | `.env` | Your secrets (gitignored — never commit) |
 | `.env.example` | Template for `.env` |
 
@@ -194,10 +243,14 @@ IDLE_TIMEOUT_MINUTES=5    # leave voice after N quiet minutes; 0 = off by defaul
 DEFAULT_VOLUME=100        # starting playback volume in percent (0-100)
 AI_BACKEND=gemini         # "gemini" or "ollama"
 GEMINI_API_KEY=           # needed if AI_BACKEND=gemini
+GEMINI_MODELS=            # optional — models to try in order (each has its own free daily quota)
 OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M   # used if AI_BACKEND=ollama
 SPOTIFY_CLIENT_ID=        # optional — only to lift the track cap on long playlists
 SPOTIFY_CLIENT_SECRET=
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
+VOICE_USER_IDS=           # voice assistant: who may use it (comma-separated IDs)
+PIPER_MODEL=              # voice assistant: Piper .onnx voice (empty = text-only replies)
+STT_DEVICE=cuda           # voice assistant: cuda or cpu
 ```
 
 ## Running the tests
@@ -211,8 +264,10 @@ no token, server, or voice connection needed, and it finishes in about a second.
 ```
 
 One test plays a generated tone through FFmpeg to check the volume math; it's
-skipped automatically if FFmpeg isn't installed. When you add a command, the
-suite also fails if you forget to list it in `help_text.py`.
+skipped automatically if FFmpeg isn't installed. The voice assistant's tests
+(listener, speaker, session, speech-to-text checks) need
+`assistant/requirements.txt`; without it they're skipped, not failed. When you
+add a command, the suite also fails if you forget to list it in `help_text.py`.
 
 ## Reinstalling dependencies later
 

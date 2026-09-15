@@ -19,6 +19,7 @@ os.environ["OWNER_ID"] = "0"
 
 import pytest  # noqa: E402
 
+import ai  # noqa: E402
 import config  # noqa: E402
 import music  # noqa: E402
 
@@ -32,15 +33,35 @@ class NullTyping:
         return False
 
 
+class FakeSentMessage:
+    # What send() returns in discord.py: a message the bot can edit or delete.
+    def __init__(self, channel, content):
+        self.channel, self.content, self.deleted = channel, content, False
+
+    async def edit(self, *, content=None, **kwargs):
+        self.content = content
+        self.channel.edits.append(content)
+
+    async def delete(self):
+        self.deleted = True
+        self.channel.deleted.append(self.content)
+
+
 class FakeTextChannel:
     def __init__(self, name="general"):
         self.name = name
         self.sent = []  # every message the bot sent here, in order
         self.silent = []  # the silent= flag of each of those messages
+        self.edits = []  # new content of every edited message, in order
+        self.deleted = []  # content of every message the bot deleted
+        self.messages = []  # the FakeSentMessage objects, in order
 
     async def send(self, content, *, silent=False, **kwargs):
         self.sent.append(content)
         self.silent.append(silent)
+        message = FakeSentMessage(self, content)
+        self.messages.append(message)
+        return message
 
     def typing(self):
         return NullTyping()
@@ -113,9 +134,10 @@ class FakeVoiceChannel:
         self.members = members if members is not None else []
         self.fail_connect = fail_connect  # an exception to raise from connect()
 
-    async def connect(self):
+    async def connect(self, *, cls=None):
         if self.fail_connect:
             raise self.fail_connect
+        self.connected_with = cls  # which VoiceClient class music asked for
         voice = FakeVoice(self.guild, self)
         self.guild.voice_client = voice
         return voice
@@ -155,6 +177,8 @@ def clean_state(monkeypatch):
     music.timeout_settings.clear()
     music.idle_since.clear()
     music.volumes.clear()
+    ai._resting_until.clear()  # which Gemini models are sitting out after "busy"
+    monkeypatch.setattr(ai, "assistant", None)  # no voice assistant unless a test adds one
     monkeypatch.setattr(config, "IDLE_TIMEOUT_MINUTES", 5)
     monkeypatch.setattr(config, "DEFAULT_VOLUME", 100)
     monkeypatch.setattr(config, "OWNER_ID", 0)
