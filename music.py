@@ -155,6 +155,11 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
         # notification. This one fires on its own at every track change, so a
         # ping per song in a long queue gets old fast.
         await entry["channel"].send(f"▶️ Now playing: **{title}**{note}", silent=True)
+        # A spoken request's reply channel (assistant/request.py) can react — e.g.
+        # say the title out loud. A normal Discord text channel has no such hook.
+        hook = getattr(entry["channel"], "on_track_started", None)
+        if hook is not None:
+            await hook(entry)
     return True
 
 

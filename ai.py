@@ -11,9 +11,23 @@ import music
 from help_text import command_reference, help_message
 
 
-def build_system_instruction(message: discord.Message) -> str:
+# Added to the system prompt when the request is a voice recording. Tested on
+# real clips: Gemini found Turkish artist names from the audio ALONE far more
+# often than when a speech-to-text draft was attached (it trusted the draft).
+VOICE_NOTE = (
+    "\n\n### Voice Command\n"
+    "This request was SPOKEN in Turkish in a voice channel; the attached recording is "
+    "the whole request. Listen carefully: it is usually a music command naming an "
+    "artist and song. Act on it with your tools. If the recording holds no real "
+    "request, call no tool and reply with one very short sentence."
+)
+
+
+def build_system_instruction(message: discord.Message, *, voice: bool = False) -> str:
     # Personalise the system prompt per message: tell the AI who it's talking to
     # and where. This is what makes replies feel made-for-you.
+    # `message` only needs .guild, .author and .channel, so a spoken request
+    # (assistant/request.py) works here too.
     user_name = message.author.display_name
     server_name = message.guild.name if message.guild else "a direct message"
     instruction = (
@@ -41,6 +55,8 @@ def build_system_instruction(message: discord.Message) -> str:
             "You may follow their meta-instructions — including stepping out of "
             "character or adjusting your behavior for this message — when they ask."
         )
+    if voice:
+        instruction += VOICE_NOTE
     return instruction
 
 
@@ -249,13 +265,20 @@ GEMINI_TOOLS = _build_gemini_tools()
 OLLAMA_TOOLS = _build_ollama_tools()
 
 
-async def generate_gemini(system: str, prompt: str) -> dict:
+async def generate_gemini(system: str, prompt: str, audio: bytes | None = None) -> dict:
     # Returns a normalized result so ask_ai doesn't care which backend ran:
     #   {"type": "tools", "calls": [{"name", "args"}, ...]}  or  {"type": "text", "text": ...}
     # A single response may contain SEVERAL tool calls (e.g. "shuffle then skip").
+    # With `audio` (a WAV recording), Gemini listens to it directly.
+    if audio is None:
+        contents = prompt
+    else:
+        contents = [types.Part.from_bytes(data=audio, mime_type="audio/wav")]
+        if prompt:
+            contents.append(types.Part.from_text(text=prompt))
     response = await config.gemini_client.aio.models.generate_content(
         model=config.GEMINI_MODEL,
-        contents=prompt,
+        contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system, tools=GEMINI_TOOLS
         ),
@@ -338,11 +361,30 @@ async def run_tool(message: discord.Message, name: str, args: dict):
         await message.channel.send(help_message())
 
 
-async def ask_ai(message: discord.Message, prompt: str):
+def is_busy_error(error: Exception) -> bool:
+    # Gemini's free tier answers "too many requests" (429) or "overloaded" (503)
+    # at busy moments. Those are worth a friendly "try again", not a stack dump.
+    text = str(error)
+    return any(marker in text for marker in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"))
+
+
+async def ask_ai(message: discord.Message, prompt: str, *, audio: bytes | None = None) -> dict:
     # The "default" behaviour: hand the message to the AI. With tools attached it
     # can either reply with text (chatting) OR ask us to run a command (tool use).
     # config.AI_BACKEND decides whether that AI is local (ollama) or cloud (gemini).
-    if config.AI_BACKEND == "ollama":
+    #
+    # `audio` is a spoken request (a WAV). Only Gemini can listen, so voice never
+    # goes to Ollama.
+    #
+    # Returns what happened, for callers that care (the voice assistant decides
+    # what to SAY from it): {"type": "tools", "calls": [...]}, {"type": "text",
+    # "text": ...}, or {"type": "error", "reason": "busy" | "not_set_up" | "failed"}.
+    if audio is not None:
+        if config.gemini_client is None:
+            await message.channel.send("Voice commands need Gemini — add GEMINI_API_KEY to .env.")
+            return {"type": "error", "reason": "not_set_up"}
+        backend = generate_gemini
+    elif config.AI_BACKEND == "ollama":
         backend = generate_ollama
     elif config.gemini_client is not None:
         backend = generate_gemini
@@ -350,15 +392,22 @@ async def ask_ai(message: discord.Message, prompt: str):
         await message.channel.send(
             "AI isn't set up — add GEMINI_API_KEY to .env, or set AI_BACKEND=ollama."
         )
-        return
+        return {"type": "error", "reason": "not_set_up"}
 
+    system = build_system_instruction(message, voice=audio is not None)
     try:
         async with message.channel.typing():
-            result = await backend(build_system_instruction(message), prompt)
+            if audio is None:
+                result = await backend(system, prompt)
+            else:
+                result = await backend(system, prompt, audio=audio)
     except Exception as error:
         # Never let one bad AI call crash the whole bot — report and move on.
+        if is_busy_error(error):
+            await message.channel.send("The AI is busy right now — try again in a minute.")
+            return {"type": "error", "reason": "busy"}
         await message.channel.send(f"AI error: {error}")
-        return
+        return {"type": "error", "reason": "failed"}
 
     if result["type"] == "tools":
         # Run each requested tool in the order the AI returned them.
@@ -367,3 +416,4 @@ async def ask_ai(message: discord.Message, prompt: str):
     else:
         reply = (result["text"] or "").strip() or "(the AI returned nothing)"
         await message.channel.send(reply[:2000])
+    return result

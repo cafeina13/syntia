@@ -188,3 +188,97 @@ async def test_generate_gemini_text_and_empty_replies(monkeypatch):
     # A blocked/empty response has no candidates at all.
     fake_gemini(monkeypatch, SimpleNamespace(candidates=None, text=None))
     assert await ai.generate_gemini("s", "hi") == {"type": "text", "text": ""}
+
+
+# --- voice requests (audio) and results --------------------------------------------
+
+
+class CapturingGemini:
+    # A fake Gemini client that records what it was sent and answers as scripted.
+    def __init__(self, response=None, error=None):
+        self.sent = []
+        self.response, self.error = response, error
+        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content=self._generate))
+
+    async def _generate(self, **kwargs):
+        self.sent.append(kwargs)
+        if self.error:
+            raise self.error
+        return self.response
+
+
+def gemini_says_tool(name, args):
+    return SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(
+        parts=[gemini_part(name, args)]))], text=None)
+
+
+async def test_audio_goes_to_gemini_as_an_audio_part(recorded, monkeypatch):
+    client = CapturingGemini(gemini_says_tool("play_music", {"query": "Tarkan Şımarık"}))
+    monkeypatch.setattr(config, "gemini_client", client)
+    result = await ai.ask_ai(make_message(FakeGuild()), "", audio=b"RIFF....WAVE")
+    [request] = client.sent
+    [part] = request["contents"]  # audio only: no text draft to anchor on
+    assert part.inline_data.mime_type == "audio/wav" and part.inline_data.data == b"RIFF....WAVE"
+    assert "### Voice Command" in request["config"].system_instruction
+    assert result == {"type": "tools", "calls": [{"name": "play_music", "args": {"query": "Tarkan Şımarık"}}]}
+    assert recorded == [("play_music", ("Tarkan Şımarık", 0))]
+
+
+async def test_text_requests_get_no_voice_note(recorded, monkeypatch):
+    client = CapturingGemini(gemini_says_tool("skip_song", {}))
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "gemini_client", client)
+    await ai.ask_ai(make_message(FakeGuild()), "şarkıyı geç")
+    assert client.sent[0]["contents"] == "şarkıyı geç"
+    assert "### Voice Command" not in client.sent[0]["config"].system_instruction
+
+
+async def test_voice_never_falls_back_to_ollama(monkeypatch):
+    called = []
+
+    async def ollama(system, prompt):
+        called.append(prompt)
+
+    monkeypatch.setattr(config, "AI_BACKEND", "ollama")
+    monkeypatch.setattr(config, "gemini_client", None)
+    monkeypatch.setattr(ai, "generate_ollama", ollama)
+    channel = FakeTextChannel()
+    result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "", audio=b"wav")
+    assert called == [] and result == {"type": "error", "reason": "not_set_up"}
+    assert channel.last.startswith("Voice commands need Gemini")
+
+
+async def test_voice_uses_gemini_even_when_text_uses_ollama(recorded, monkeypatch):
+    client = CapturingGemini(gemini_says_tool("skip_song", {}))
+    monkeypatch.setattr(config, "AI_BACKEND", "ollama")
+    monkeypatch.setattr(config, "gemini_client", client)
+    await ai.ask_ai(make_message(FakeGuild()), "", audio=b"wav")
+    assert len(client.sent) == 1 and recorded == [("skip_song", ())]
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("429 RESOURCE_EXHAUSTED. You exceeded your current quota"),
+    RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand"),
+])
+async def test_busy_gemini_gets_a_friendly_message(monkeypatch, error):
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "gemini_client", CapturingGemini(error=error))
+    channel = FakeTextChannel()
+    result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hi")
+    assert result == {"type": "error", "reason": "busy"}
+    assert channel.last == "The AI is busy right now — try again in a minute."
+
+
+async def test_other_errors_still_show_the_details(monkeypatch):
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "gemini_client", CapturingGemini(error=ValueError("bad request")))
+    channel = FakeTextChannel()
+    result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hi")
+    assert result == {"type": "error", "reason": "failed"} and channel.last == "AI error: bad request"
+
+
+async def test_text_reply_is_returned_too(ollama_backend):
+    ollama_backend["result"] = {"type": "text", "text": "Merhaba!"}
+    channel = FakeTextChannel()
+    result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "selam")
+    assert result == {"type": "text", "text": "Merhaba!"} and channel.last == "Merhaba!"

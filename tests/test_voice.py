@@ -197,3 +197,38 @@ def test_volume_really_scales_ffmpeg_audio():
     finally:
         source.cleanup()
     assert quiet / loud == pytest.approx(0.1, abs=0.01)
+
+
+# --- the track-started hook (for spoken requests) ------------------------------------
+
+
+async def test_track_started_hook_runs_when_the_channel_has_one(connected, monkeypatch):
+    voice, message = connected
+    started = []
+
+    class HookedChannel(FakeTextChannel):
+        async def on_track_started(self, entry):
+            started.append(entry["title"])
+
+    async def fake_resolve(query):
+        return {"url": "u", "title": "Şımarık", "webpage_url": None, "duration": 200}
+
+    monkeypatch.setattr(music, "resolve_stream", fake_resolve)
+    monkeypatch.setattr(music.discord, "FFmpegPCMAudio", SilentSource)
+    channel = HookedChannel()
+    song = {"query": "tarkan", "title": "tarkan", "start_seconds": 0, "channel": channel}
+    assert await music._start_track(message.guild, song, 0)
+    assert started == ["Şımarık"] and channel.last.startswith("▶️ Now playing")
+
+
+async def test_plain_channels_have_no_hook_and_nothing_breaks(connected, monkeypatch):
+    voice, message = connected
+
+    async def fake_resolve(query):
+        return {"url": "u", "title": "Song", "webpage_url": None, "duration": None}
+
+    monkeypatch.setattr(music, "resolve_stream", fake_resolve)
+    monkeypatch.setattr(music.discord, "FFmpegPCMAudio", SilentSource)
+    assert not hasattr(message.channel, "on_track_started")
+    song = {"query": "x", "title": "x", "start_seconds": 0, "channel": message.channel}
+    assert await music._start_track(message.guild, song, 0)
