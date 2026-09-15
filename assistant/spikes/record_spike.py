@@ -1,9 +1,10 @@
 """
-Spike 1: can we HEAR people in voice, with our own code, and how much does it cost?
+Spikes 1 + 3: can we HEAR people in voice, and can Syntia SPEAK?
 
 A tiny standalone bot (not Syntia's music bot) that joins your voice channel,
-records every permitted speaker to a WAV file, and reports packet stats and
-CPU use. Uses the same bot token, so STOP the music bot before running this.
+records every permitted speaker to a WAV file and reports packet stats and CPU
+use, and speaks text with your Piper voice. Uses the same bot token, so STOP
+the music bot before running this.
 
     .venv\\Scripts\\python.exe -m assistant.spikes.record_spike
 
@@ -11,6 +12,7 @@ Then in a text channel, while you're in voice:
     spike rec     join and start recording
     spike stats   packet counts so far
     spike stop    save WAVs to recordings/, print stats, leave
+    spike say <text>   speak it with the Piper voice (PIPER_MODEL in .env)
 
 .env: VOICE_USER_IDS=123,456 limits recording to those users (default: whoever
 typed `spike rec`).
@@ -29,6 +31,11 @@ from dotenv import load_dotenv
 
 from assistant.voice_receive import BYTES_PER_SAMPLE, SAMPLES_PER_FRAME, VoiceReceiver
 
+try:
+    from assistant.tts import Voice
+except ImportError:  # piper-tts not installed: `spike say` just explains
+    Voice = None
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PERMITTED = {int(x) for x in os.getenv("VOICE_USER_IDS", "").replace(" ", "").split(",") if x}
@@ -36,6 +43,8 @@ PREFIX = "spike "
 OUT_DIR = Path(__file__).resolve().parent.parent.parent / "recordings"
 MAX_SECONDS = 300  # per user, so a forgotten recording can't eat all the RAM
 MAX_GAP_SECONDS = 1.0  # longer silences get squashed to this in the WAV
+PIPER_MODEL = os.getenv("PIPER_MODEL")
+_voice = None  # loaded on first `spike say`
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -151,6 +160,34 @@ async def stop_recording(message: discord.Message):
     )
 
 
+async def say(message: discord.Message, text: str):
+    global _voice
+    if not text:
+        await message.channel.send("Usage: `spike say Tamam, hallediyorum.`")
+        return
+    if Voice is None or not PIPER_MODEL:
+        await message.channel.send("Needs `pip install piper-tts` and PIPER_MODEL=<path to .onnx> in .env.")
+        return
+    if not message.author.voice or not message.author.voice.channel:
+        await message.channel.send("Join a voice channel first.")
+        return
+    voice = message.guild.voice_client or await message.author.voice.channel.connect()
+    if voice.is_playing():
+        await message.channel.send("Still speaking, one moment.")
+        return
+    started = time.perf_counter()
+    if _voice is None:
+        _voice = await asyncio.to_thread(Voice, PIPER_MODEL)
+    loaded = time.perf_counter()
+    pcm = await asyncio.to_thread(_voice.synthesize, text)
+    synthesized = time.perf_counter()
+    voice.play(_voice.to_discord(pcm))
+    await message.channel.send(
+        f"Speaking {_voice.seconds(pcm):.1f}s of audio. Voice load {1000 * (loaded - started):.0f} ms, "
+        f"synthesis {1000 * (synthesized - loaded):.0f} ms."
+    )
+
+
 @client.event
 async def on_ready():
     print(f"Spike bot ready as {client.user}. Type `spike rec` while in voice.")
@@ -166,6 +203,9 @@ async def on_message(message: discord.Message):
         await start_recording(message)
     elif text == PREFIX + "stop":
         await stop_recording(message)
+    elif text.startswith(PREFIX + "say"):
+        # Keep the original casing and Turkish letters for the speech itself.
+        await say(message, message.content.strip()[len(PREFIX + "say"):].strip())
     elif text == PREFIX + "stats":
         await message.channel.send(summary(message.guild) if session else "Not recording.")
 
