@@ -199,7 +199,7 @@ async def test_disconnect_forgets_the_speaker(receiver):
     receiver.handle_datagram(discord_py_packet(opus_tone()))
     await receiver.voice.ws._hook(receiver.voice.ws, {"op": DiscordVoiceWebSocket.CLIENT_DISCONNECT,
                                                       "d": {"user_id": str(USER)}})
-    assert SSRC not in receiver.ssrc_to_user and SSRC not in receiver.decoders
+    assert SSRC not in receiver.ssrc_to_user
 
 
 async def test_previous_hook_still_runs():
@@ -251,3 +251,70 @@ async def test_dave_passes_silence_frames_through():
     rx, heard = await make_dave_receiver(dave)
     rx.handle_datagram(discord_py_packet(OPUS_SILENCE))
     assert heard == [USER] and dave.calls == []
+
+
+# --- identifying speakers from the moment of connecting ----------------------------
+
+
+def test_track_speakers_learns_and_forgets():
+    mapping = {}
+    vr.track_speakers(mapping, {"op": DiscordVoiceWebSocket.SPEAKING,
+                                "d": {"user_id": str(USER), "ssrc": SSRC, "speaking": 1}})
+    vr.track_speakers(mapping, {"op": DiscordVoiceWebSocket.HEARTBEAT_ACK, "d": 123})
+    assert mapping == {SSRC: USER}
+    vr.track_speakers(mapping, {"op": DiscordVoiceWebSocket.CLIENT_DISCONNECT, "d": {"user_id": str(USER)}})
+    assert mapping == {}
+
+
+async def test_listening_client_installs_its_hook_before_connecting():
+    # The real class, built without a network: the connection state it creates
+    # must carry our hook, so the voice websocket calls it from its first message.
+    loop = __import__("asyncio").get_running_loop()
+    fake_client = SimpleNamespace(_connection=SimpleNamespace(loop=loop), user=SimpleNamespace(id=1))
+    channel = SimpleNamespace(guild=SimpleNamespace(id=1), id=2)
+    voice = vr.ListeningVoiceClient(fake_client, channel)
+    assert voice._connection.hook == voice._on_voice_message
+    await voice._on_voice_message(None, {"op": DiscordVoiceWebSocket.SPEAKING,
+                                          "d": {"user_id": str(USER), "ssrc": SSRC}})
+    assert voice.ssrc_to_user == {SSRC: USER}
+
+
+async def test_receiver_uses_speakers_known_before_it_started():
+    # Regression: the user spoke (or `spike say` had joined) BEFORE listening
+    # began, so the one SPEAKING message was missed -> every packet "unknown_ssrc".
+    heard = []
+    voice = fake_voice()
+    voice.ssrc_to_user = {SSRC: USER}  # learned at connect time by ListeningVoiceClient
+    rx = vr.VoiceReceiver(voice, lambda user, pcm, ts: heard.append(user), users={USER})
+    rx.start()
+    assert voice._connection.hook is None and "_hook" not in voice.ws.__dict__  # nothing patched
+    rx.handle_datagram(discord_py_packet(opus_tone()))
+    assert heard == [USER] and rx.stats["unknown_ssrc"] == 0
+    rx.stop()
+    rx2 = vr.VoiceReceiver(voice, lambda user, pcm, ts: heard.append(user), users={USER})
+    rx2.start()  # a second listen session on the same connection still knows them
+    rx2.handle_datagram(discord_py_packet(opus_tone(), sequence=2))
+    assert heard == [USER, USER]
+
+
+async def test_failed_dave_packets_are_concealed_not_dropped():
+    # A lost 20 ms mid-word used to leave a hole; now Opus fills in a guess so
+    # the audio keeps its timing (and the failure is logged with its reason).
+    dave = FakeDave()
+    heard = []
+    rx = vr.VoiceReceiver(fake_voice(dave), lambda u, p, t: heard.append(len(p)), users=None)
+    rx.start()
+    await speaking(rx, USER, SSRC)
+    rx.handle_datagram(discord_py_packet(opus_tone(), sequence=1))
+    dave.fail = True
+    rx.handle_datagram(discord_py_packet(opus_tone(), sequence=2))
+    assert heard == [960 * vr.BYTES_PER_SAMPLE] * 2  # two 20 ms chunks, one of them invented
+    assert rx.stats["frames"] == 1 and rx.stats["concealed"] == 1 and rx.stats["dave_failed"] == 1
+    assert rx.loss_log == [(USER, 0.02, "dave_failed")]
+    assert rx.loss_reasons == {"RuntimeError: no key for user": 1}
+
+
+async def test_failure_before_any_audio_is_skipped():
+    rx, heard = await make_dave_receiver(FakeDave(fail=True))
+    rx.handle_datagram(discord_py_packet(opus_tone()))
+    assert heard == [] and rx.stats["dave_failed"] == 1 and rx.stats["concealed"] == 0

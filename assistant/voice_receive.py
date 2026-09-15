@@ -32,6 +32,7 @@ import discord
 import nacl.secret
 from discord.gateway import DiscordVoiceWebSocket
 from discord.opus import OPUS_SILENCE, Decoder
+from discord.voice_state import VoiceConnectionState
 
 try:
     import davey
@@ -103,6 +104,40 @@ def is_newer(sequence: int, last: int) -> bool:
     return 0 < ((sequence - last) & 0xFFFF) < 0x8000
 
 
+def track_speakers(ssrc_to_user: dict[int, int], msg: dict):
+    # Discord announces "user X sends audio as SSRC Y" (op 5 SPEAKING) ONCE per
+    # user, the first time they talk after we join — miss it and that user's
+    # audio is anonymous for the rest of the call.
+    op, data = msg.get("op"), msg.get("d") or {}
+    if op == DiscordVoiceWebSocket.SPEAKING and "ssrc" in data and "user_id" in data:
+        ssrc_to_user[int(data["ssrc"])] = int(data["user_id"])
+    elif op == DiscordVoiceWebSocket.CLIENT_DISCONNECT and "user_id" in data:
+        gone = int(data["user_id"])
+        for ssrc in [s for s, u in ssrc_to_user.items() if u == gone]:
+            ssrc_to_user.pop(ssrc)
+
+
+class ListeningVoiceClient(discord.VoiceClient):
+    """
+    A VoiceClient that tracks who is who from the moment it connects.
+
+    Use it with `await channel.connect(cls=ListeningVoiceClient)`. A plain
+    VoiceClient only lets a receiver start watching later, by which time
+    Discord may already have sent the one message that names each speaker.
+    """
+
+    def __init__(self, client, channel):
+        self.ssrc_to_user: dict[int, int] = {}  # set BEFORE super(): connecting starts there
+        super().__init__(client, channel)
+
+    def create_connection_state(self):
+        # discord.py's extension point: give the voice websocket our hook up front.
+        return VoiceConnectionState(self, hook=self._on_voice_message)
+
+    async def _on_voice_message(self, ws, msg: dict):
+        track_speakers(self.ssrc_to_user, msg)
+
+
 class VoiceReceiver:
     """Attach to a connected VoiceClient and get decoded audio per user."""
 
@@ -112,11 +147,21 @@ class VoiceReceiver:
         self.on_audio = on_audio
         self.users = users  # None = everyone; otherwise only these user IDs
         self.loop = asyncio.get_running_loop()
-        self.ssrc_to_user: dict[int, int] = {}
-        self.decoders: dict[int, Decoder] = {}
-        self.last_sequence: dict[int, int] = {}
+        # A ListeningVoiceClient already knows every speaker since it connected;
+        # share its live map. Otherwise we can only learn speakers from now on.
+        self.ssrc_to_user: dict[int, int] = getattr(voice, "ssrc_to_user", None)
+        self.tracks_itself = self.ssrc_to_user is not None
+        if not self.tracks_itself:
+            self.ssrc_to_user = {}
+        # Keyed by (ssrc, user): if Discord hands a leaver's SSRC to someone
+        # new, they get a fresh decoder instead of the old one's state.
+        self.decoders: dict[tuple[int, int], Decoder] = {}
+        self.last_sequence: dict[tuple[int, int], int] = {}
         self.stats: Counter = Counter()
         self.cpu_seconds = 0.0  # time spent decrypting + decoding, for measuring
+        self.user_seconds: dict[int, float] = {}  # audio delivered per user so far
+        self.loss_log: list[tuple[int, float, str]] = []  # (user, seconds into their audio, why)
+        self.loss_reasons: Counter = Counter()  # error messages from davey, counted
         self._previous_hook = None
         self._running = False
 
@@ -124,11 +169,12 @@ class VoiceReceiver:
 
     def start(self):
         state = self.voice._connection
-        self._previous_hook = state.hook
-        # state.hook is used when the voice websocket (re)connects; the live
-        # socket copied it at creation, so patch that one too.
-        state.hook = self._websocket_hook
-        self.voice.ws._hook = self._websocket_hook
+        if not self.tracks_itself:
+            self._previous_hook = state.hook
+            # state.hook is used when the voice websocket (re)connects; the live
+            # socket copied it at creation, so patch that one too.
+            state.hook = self._websocket_hook
+            self.voice.ws._hook = self._websocket_hook
         state.add_socket_listener(self._on_datagram)
         self._running = True
 
@@ -138,24 +184,17 @@ class VoiceReceiver:
         self._running = False
         state = self.voice._connection
         state.remove_socket_listener(self._on_datagram)
-        state.hook = self._previous_hook
-        if self._previous_hook is None:
-            self.voice.ws.__dict__.pop("_hook", None)  # back to the class no-op
-        else:
-            self.voice.ws._hook = self._previous_hook
+        if not self.tracks_itself:
+            state.hook = self._previous_hook
+            if self._previous_hook is None:
+                self.voice.ws.__dict__.pop("_hook", None)  # back to the class no-op
+            else:
+                self.voice.ws._hook = self._previous_hook
 
-    # --- who is who ------------------------------------------------------------
+    # --- who is who (plain VoiceClient only) ------------------------------------
 
     async def _websocket_hook(self, ws, msg: dict):
-        op, data = msg.get("op"), msg.get("d") or {}
-        if op == DiscordVoiceWebSocket.SPEAKING and "ssrc" in data and "user_id" in data:
-            self.ssrc_to_user[int(data["ssrc"])] = int(data["user_id"])
-        elif op == DiscordVoiceWebSocket.CLIENT_DISCONNECT and "user_id" in data:
-            gone = int(data["user_id"])
-            for ssrc in [s for s, u in self.ssrc_to_user.items() if u == gone]:
-                self.ssrc_to_user.pop(ssrc)
-                self.decoders.pop(ssrc, None)
-                self.last_sequence.pop(ssrc, None)
+        track_speakers(self.ssrc_to_user, msg)
         if self._previous_hook is not None:
             await self._previous_hook(ws, msg)
 
@@ -191,21 +230,29 @@ class VoiceReceiver:
         if self.users is not None and user_id not in self.users:
             self.stats["ignored_user"] += 1  # skipped BEFORE any crypto work
             return
-        last = self.last_sequence.get(packet.ssrc)
+        stream = (packet.ssrc, user_id)
+        last = self.last_sequence.get(stream)
         if last is not None and not is_newer(packet.sequence, last):
             self.stats["late_or_duplicate"] += 1
             return
-        self.last_sequence[packet.ssrc] = packet.sequence
+        self.last_sequence[stream] = packet.sequence
 
         opus = decrypt_transport(packet, self.voice._connection.secret_key)
         opus = self._decrypt_dave(user_id, opus)
+        decoder = self.decoders.get(stream)
         if opus is None:
-            return
-        decoder = self.decoders.get(packet.ssrc)
-        if decoder is None:
-            decoder = self.decoders[packet.ssrc] = Decoder()
-        pcm = decoder.decode(opus, fec=False)
-        self.stats["frames"] += 1
+            if decoder is None:
+                return  # nothing heard from them yet to guess from
+            # Packet loss concealment: Opus invents a plausible 20 ms from what came
+            # before, so the audio keeps its timing instead of a word losing a slice.
+            pcm = decoder.decode(None, fec=False)
+            self.stats["concealed"] += 1
+        else:
+            if decoder is None:
+                decoder = self.decoders[stream] = Decoder()
+            pcm = decoder.decode(opus, fec=False)
+            self.stats["frames"] += 1
+        self.user_seconds[user_id] = self.user_seconds.get(user_id, 0.0) + len(pcm) / BYTES_PER_SAMPLE / 48000
         self.on_audio(user_id, pcm, packet.timestamp)
 
     def _decrypt_dave(self, user_id: int, opus: bytes) -> bytes | None:
@@ -216,10 +263,18 @@ class VoiceReceiver:
         if opus == OPUS_SILENCE:
             return opus  # silence frames are sent unencrypted
         if not session.ready:
-            self.stats["dave_not_ready"] += 1
+            self._log_loss(user_id, "dave_not_ready")
             return None
         try:
             return session.decrypt(user_id, davey.MediaType.audio, opus)
-        except Exception:
-            self.stats["dave_failed"] += 1
+        except Exception as error:
+            self._log_loss(user_id, "dave_failed", error)
             return None
+
+    def _log_loss(self, user_id: int, kind: str, error: Exception | None = None):
+        self.stats[kind] += 1
+        if error is not None:
+            self.loss_reasons[f"{type(error).__name__}: {error}"[:120]] += 1
+        if len(self.loss_log) < 1000:
+            # When, in that user's audio timeline, so it lines up with a recording.
+            self.loss_log.append((user_id, round(self.user_seconds.get(user_id, 0.0), 2), kind))

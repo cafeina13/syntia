@@ -27,12 +27,9 @@ from faster_whisper.audio import decode_audio
 ROOT = Path(__file__).resolve().parent.parent.parent
 DATASET = Path(r"\\wsl$\Ubuntu\home\cafeina\TTS\data\merve")
 SAMPLE_RATE = 16000  # what Whisper works in
-
-# A sample of the command vocabulary, given to Whisper up front. On the sick-voice
-# spike recording it cut word errors from 44% to 12% (optimistic: written after
-# hearing that recording). Real commands, so it is fair to use in production.
-HINT = ("Syntia. Müzik çal, şarkıyı geç, sesi kıs, sesi aç, ses seviyesini 20'ye ayarla, "
-        "şarkıyı durdur, 30 saniye ileri al, 2. dakikadan başlat.")
+# The vocabulary hint now lives with the real transcriber. (It was tuned on the
+# spike 1 recording, so scores on that same file are optimistic.)
+from assistant.stt import HINT  # noqa: E402
 
 
 def peak_ram_mb() -> float:
