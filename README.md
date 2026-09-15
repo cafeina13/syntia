@@ -17,7 +17,12 @@ commented — read it top to bottom to follow how each piece works.
   can reply *or* decide to run a command itself (tool calling), and points you
   to the right command when you mistype one.
 - **Switchable AI backend**: cloud **Gemini** (free tier) or local **Ollama** —
-  set by one line in `.env`.
+  set by one line in `.env`. Gemini falls back to another model when one is busy
+  or out of its free daily quota, and a slow answer shows a live status instead
+  of silence.
+- **Voice assistant** *(optional, experimental)*: say **"hey jarvis, …"** in the
+  voice channel and Syntia does it, with short spoken replies — see
+  [Voice assistant](#voice-assistant-experimental).
 - A custom `syntia ` chat prefix, a `help` command, and a few slash commands.
 
 ## Requirements
@@ -25,6 +30,8 @@ commented — read it top to bottom to follow how each piece works.
 - **Python 3.13** (3.12 also fine).
 - **FFmpeg** installed and on your PATH (it streams the audio). Check with
   `ffmpeg -version`.
+- *Only for the voice assistant:* an **NVIDIA GPU** is recommended (~1 GB of VRAM
+  for fast speech-to-text); it also works on the CPU, just slower.
 
 ## Setup
 
@@ -149,6 +156,7 @@ Type these in any text channel (you must be in a voice channel for music):
 | `syntia join` (or `come` / `summon`) | Join your voice channel without playing anything |
 | `syntia timeout` | Show the idle auto-leave setting |
 | `syntia timeout on` / `off` / `<minutes>` | Change it (owner or Manage Server only) |
+| `syntia assistant` / `on` / `off` | Show, start or stop the voice assistant (people in `VOICE_USER_IDS` + the owner) — also works in plain words, e.g. `syntia odaya gel ve sesli asistanı başlat` |
 | `syntia roll [N]` | Roll a dice (1–N, default 6) |
 | `syntia help` (or `commands`) | List all commands |
 | `syntia <anything else>` | Talk to the AI (it may also start music) |
@@ -216,10 +224,12 @@ In `.env`:
 | `System_Prompt.md` | The AI's personality and rules (plain Markdown) |
 | `spotify_login.py` | One-time Spotify login helper |
 | `assistant/` | The optional voice assistant (see above), plus `spikes/` — the experiments it grew from |
+| `assistant/requirements.txt` | Extra packages for the voice assistant (Whisper, openWakeWord, Piper, cuBLAS) |
 | `tests/` | Offline test suite (see [Running the tests](#running-the-tests)) |
 | `pytest.ini` | Test runner settings |
 | `requirements.txt` | What the bot needs to run |
 | `requirements-dev.txt` | Extra packages for running the tests |
+| `models/`, `recordings/` | Voice models and debug recordings (gitignored, local only) |
 | `.env` | Your secrets (gitignored — never commit) |
 | `.env.example` | Template for `.env` |
 
@@ -254,8 +264,10 @@ no token, server, or voice connection needed, and it finishes in about a second.
 ```
 
 One test plays a generated tone through FFmpeg to check the volume math; it's
-skipped automatically if FFmpeg isn't installed. When you add a command, the
-suite also fails if you forget to list it in `help_text.py`.
+skipped automatically if FFmpeg isn't installed. The voice assistant's tests
+(listener, speaker, session, speech-to-text checks) need
+`assistant/requirements.txt`; without it they're skipped, not failed. When you
+add a command, the suite also fails if you forget to list it in `help_text.py`.
 
 ## Reinstalling dependencies later
 

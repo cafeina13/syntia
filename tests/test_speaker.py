@@ -1,10 +1,17 @@
 """Syntia speaking in voice (assistant/speaker.py): alone, over music, and when not to."""
 
+import pytest
+
+# These tests need the optional voice assistant packages; without them, skip
+# instead of crashing the whole run.
+pytest.importorskip("numpy", reason="voice assistant packages not installed (pip install -r assistant/requirements.txt)")
+pytest.importorskip("scipy", reason="voice assistant packages not installed (pip install -r assistant/requirements.txt)")
+
+
 import asyncio
 
 import discord
 import numpy as np
-import pytest
 from conftest import FakeVoice
 
 import music

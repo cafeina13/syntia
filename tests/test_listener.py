@@ -1,7 +1,14 @@
 """The wake word -> capture state machine (assistant/listener.py), on a fake clock."""
 
-import numpy as np
 import pytest
+
+# These tests need the optional voice assistant packages; without them, skip
+# instead of crashing the whole run.
+pytest.importorskip("numpy", reason="voice assistant packages not installed (pip install -r assistant/requirements.txt)")
+pytest.importorskip("scipy", reason="voice assistant packages not installed (pip install -r assistant/requirements.txt)")
+
+
+import numpy as np
 
 from assistant import listener as ls
 

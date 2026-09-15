@@ -2,6 +2,13 @@
 
 import pytest
 
+# These tests need the optional voice assistant packages; without them, skip
+# instead of crashing the whole run.
+pytest.importorskip("numpy", reason="voice assistant packages not installed (pip install -r assistant/requirements.txt)")
+pytest.importorskip("faster_whisper", reason="voice assistant packages not installed (pip install -r assistant/requirements.txt)")
+
+
+
 from assistant import stt
 
 
