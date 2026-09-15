@@ -20,6 +20,11 @@ import config
 # thread when a song ends, and needs the bot's event loop to hop back onto.
 client = None
 
+# The VoiceClient class every voice connection uses. The optional voice assistant
+# swaps in one that also tracks who is speaking from the moment it connects
+# (assistant/voice_receive.py); the music bot itself doesn't need that.
+VOICE_CLIENT_CLASS = discord.VoiceClient
+
 # How yt-dlp finds audio. "ytsearch" means plain text like "lofi hip hop" gets
 # searched on YouTube; a full YouTube URL also works. noplaylist=True keeps each
 # request to a single track (playlists are expanded separately).
@@ -145,6 +150,10 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
         discord.FFmpegPCMAudio(stream_url, **ffmpeg_options(int(offset))),
         volume=get_volume(guild.id) / 100,
     )
+    # The voice assistant may be mid-sentence ("Tamam, hallediyorum") when the
+    # song is ready. Speech is marked is_speech; cut it so play() doesn't refuse.
+    if voice.is_playing() and getattr(voice.source, "is_speech", False):
+        voice.stop()
     # after=... runs when THIS song finishes -> kick off the next one.
     voice.play(source, after=lambda error: schedule_next(guild))
     player.started_at = time.monotonic()  # start the position clock
@@ -231,7 +240,7 @@ async def resume_after_reconnect(guild: discord.Guild):
     await asyncio.sleep(2)  # let the fresh gateway session settle before voice
     try:
         if guild.voice_client is None:
-            voice = await channel.connect()
+            voice = await channel.connect(cls=VOICE_CLIENT_CLASS)
             _run_in_background(_clear_speaking_ring(voice))
         else:
             await guild.voice_client.move_to(channel)
@@ -457,7 +466,7 @@ async def ensure_voice(message: discord.Message):
     channel = message.author.voice.channel
     voice = message.guild.voice_client
     if voice is None:
-        voice = await channel.connect()
+        voice = await channel.connect(cls=VOICE_CLIENT_CLASS)
         # In the background, so a play command doesn't wait on it.
         _run_in_background(_clear_speaking_ring(voice))
     elif voice.channel != channel:

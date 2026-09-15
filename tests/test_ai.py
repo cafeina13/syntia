@@ -456,3 +456,52 @@ async def test_text_reply_is_returned_too(ollama_backend):
     channel = FakeTextChannel()
     result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "selam")
     assert result == {"type": "text", "text": "Merhaba!"} and channel.last == "Merhaba!"
+
+
+class FakeAssistant:
+    def __init__(self):
+        self.commands = []
+
+    async def command(self, message, arg):
+        self.commands.append(arg)
+
+
+def gemini_says_tools(*names):
+    return SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(
+        parts=[gemini_part(name, {}) for name in names]))], text=None)
+
+
+async def test_join_and_start_the_assistant_in_one_sentence(recorded, monkeypatch):
+    # Regression (live): "syntia odaya gel ve sesli asistanı başlat" joined but
+    # couldn't start the assistant — there was no tool for it.
+    assistant = FakeAssistant()
+    monkeypatch.setattr(ai, "assistant", assistant)
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "gemini_client",
+                        CapturingGemini(gemini_says_tools("join_voice", "turn_on_assistant")))
+    await ai.ask_ai(make_message(FakeGuild()), "odaya gel ve sesli asistanı başlat")
+    assert recorded == [("join_voice", ())] and assistant.commands == ["on"]
+
+
+async def test_typed_assistant_off_really_turns_it_off(monkeypatch):
+    assistant = FakeAssistant()
+    monkeypatch.setattr(ai, "assistant", assistant)
+    await ai.run_tool(make_message(FakeGuild()), "turn_off_assistant", {})
+    assert assistant.commands == ["off"]
+
+
+@pytest.mark.parametrize("tool_name", ["turn_on_assistant", "turn_off_assistant"])
+async def test_assistant_tools_without_the_assistant(tool_name):
+    channel = FakeTextChannel()
+    await ai.run_tool(make_message(FakeGuild(), channel=channel), tool_name, {})
+    assert channel.last == "The voice assistant isn't available on this bot."
+
+
+def test_voice_note_does_not_push_everything_towards_music():
+    # Regression (live): "assistant off" by voice played a YouTube video, because
+    # the note said requests are "usually a music command".
+    note = ai.VOICE_NOTE
+    assert "ONLY when the request clearly asks for music" in note
+    assert "usually a music command" not in note
+    names = [spec["name"] for spec in ai.TOOL_SPECS]
+    assert "turn_off_assistant" in names and "turn_on_assistant" in names

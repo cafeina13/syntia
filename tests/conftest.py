@@ -134,9 +134,10 @@ class FakeVoiceChannel:
         self.members = members if members is not None else []
         self.fail_connect = fail_connect  # an exception to raise from connect()
 
-    async def connect(self):
+    async def connect(self, *, cls=None):
         if self.fail_connect:
             raise self.fail_connect
+        self.connected_with = cls  # which VoiceClient class music asked for
         voice = FakeVoice(self.guild, self)
         self.guild.voice_client = voice
         return voice
@@ -177,6 +178,7 @@ def clean_state(monkeypatch):
     music.idle_since.clear()
     music.volumes.clear()
     ai._resting_until.clear()  # which Gemini models are sitting out after "busy"
+    monkeypatch.setattr(ai, "assistant", None)  # no voice assistant unless a test adds one
     monkeypatch.setattr(config, "IDLE_TIMEOUT_MINUTES", 5)
     monkeypatch.setattr(config, "DEFAULT_VOLUME", 100)
     monkeypatch.setattr(config, "OWNER_ID", 0)

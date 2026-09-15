@@ -20,9 +20,11 @@ from help_text import command_reference, help_message
 VOICE_NOTE = (
     "\n\n### Voice Command\n"
     "This request was SPOKEN in Turkish in a voice channel; the attached recording is "
-    "the whole request. Listen carefully: it is usually a music command naming an "
-    "artist and song. Act on it with your tools. If the recording holds no real "
-    "request, call no tool and reply with one very short sentence."
+    "the whole request. Listen carefully. It can be anything a typed message could be: "
+    "a music command (often naming an artist and song), a question, or something about "
+    "the voice assistant itself. Use a music tool ONLY when the request clearly asks for "
+    "music. If you can't tell what was asked, call no tool and say in one short Turkish "
+    "sentence that you didn't understand."
 )
 
 
@@ -200,6 +202,26 @@ TOOL_SPECS = [
         "required": ["level"],
     },
     {
+        "name": "turn_on_assistant",
+        "description": (
+            "Turn on the VOICE assistant in the user's voice channel, so they can give "
+            "commands by saying 'hey jarvis'. Joins the channel if needed. Use for "
+            "'assistant on', 'start listening', 'sesli asistanı başlat', 'asistanı aç'."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    {
+        "name": "turn_off_assistant",
+        "description": (
+            "Turn off the VOICE assistant: stop listening for the wake word. The music "
+            "keeps playing and the bot stays in the channel. Use for 'assistant off', "
+            "'stop listening', 'asistanı kapat', 'dinlemeyi bırak'."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    {
         "name": "join_voice",
         "description": (
             "Join the user's voice channel WITHOUT playing anything. Use for "
@@ -263,6 +285,10 @@ def _build_ollama_tools():
         })
     return tools
 
+
+# The optional voice assistant's manager (assistant/session.py), handed over by
+# bot.py when it's available. ai.py never imports the assistant itself.
+assistant = None
 
 GEMINI_TOOLS = _build_gemini_tools()
 OLLAMA_TOOLS = _build_ollama_tools()
@@ -462,6 +488,21 @@ async def run_tool(message: discord.Message, name: str, args: dict):
     elif name == "set_volume":
         level = max(0, min(100, int(args.get("level") or 0)))
         await music.set_volume(message, str(level))
+    elif name == "turn_on_assistant":
+        if assistant is None:
+            await message.channel.send("The voice assistant isn't available on this bot.")
+        else:
+            await assistant.command(message, "on")  # checks permission, joins, loads models
+    elif name == "turn_off_assistant":
+        # A spoken request's reply channel says goodbye first; a typed one just
+        # switches it off like `syntia assistant off`.
+        hook = getattr(message.channel, "on_turn_off_assistant", None)
+        if hook is not None:
+            await hook()
+        elif assistant is not None:
+            await assistant.command(message, "off")
+        else:
+            await message.channel.send("The voice assistant isn't available on this bot.")
     elif name == "join_voice":
         await music.join_voice(message)
     elif name == "show_help":
@@ -519,6 +560,11 @@ async def ask_ai(message: discord.Message, prompt: str, *, audio: bytes | None =
         await message.channel.send(f"AI error: {error}")
         return {"type": "error", "reason": "failed"}
     await progress.finish()  # status message (if any) goes away before the answer shows
+    # A spoken request can react as soon as the AI has decided, before tools run
+    # (e.g. say "Tamam, hallediyorum" while a song takes seconds to load).
+    hook = getattr(message.channel, "on_ai_result", None)
+    if hook is not None:
+        await hook(result)
 
     if result["type"] == "tools":
         # Run each requested tool in the order the AI returned them.

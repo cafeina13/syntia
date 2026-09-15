@@ -169,6 +169,41 @@ server until the next restart.
 
 Slash commands also exist: `/help`, `/ping`, `/hello`, `/echo`.
 
+## Voice assistant (experimental)
+
+Talk to Syntia in the voice channel instead of typing:
+
+> **"hey jarvis, Tarkan'dan Şımarık çal"** → *"Tamam, hallediyorum."* … the song starts … *"Tarkan, Şımarık çalıyorum."*
+
+`syntia assistant on` starts listening in your voice channel, `syntia assistant off`
+stops it, and `syntia assistant` shows whether it's on. Say **"hey jarvis"** and your
+command in one breath, or say "hey jarvis", wait for the chime, then speak. It
+works for everything you could type: play, skip, volume, questions…
+
+How it works, in order:
+
+1. **Receive** your voice from Discord with our own decoder (`assistant/voice_receive.py`, including Discord's end-to-end voice encryption).
+2. **Wake word:** "hey jarvis" via openWakeWord, then record until you stop talking (`assistant/listener.py`).
+3. **Gate:** Whisper checks locally whether there was real speech, so no AI request is spent on noise (`assistant/stt.py`).
+4. **Understand:** Gemini **listens to the recording itself**, which is far better with Turkish artist and song names than a transcript, and runs Syntia's usual tools.
+5. **Speak:** short replies in a Piper voice (`assistant/tts.py`, `assistant/speaker.py`). Music dips under the voice instead of stopping. What it says lives in `assistant/phrases.py`, kept to the main actions on purpose.
+
+**Setup** (the music bot never needs any of this):
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r assistant/requirements.txt
+```
+
+In `.env`:
+- `VOICE_USER_IDS` — who may use it (the owner always can).
+- `PIPER_MODEL` — path to a Piper `.onnx` voice. Without it, replies are text-only.
+- `STT_DEVICE` — `cuda` (fast, ~1 GB of VRAM) or `cpu` (keeps the GPU free, ~3 s per command).
+
+**Good to know:**
+- **Resources:** models load on `on` and unload on `off`, which frees the VRAM for games. The idle timeout still applies (`syntia timeout off` to keep it around), and the assistant switches itself off whenever the bot leaves voice.
+- **Privacy:** only the listed users' audio is ever decoded. Nothing is saved. After a wake word, that command clip is sent to Gemini to be understood.
+- **Noise:** loud fans or background noise can hide the wake word. Discord's own noise suppression (Krisp) helps a lot.
+
 ## Project layout
 
 | File | What's in it |
@@ -180,6 +215,7 @@ Slash commands also exist: `/help`, `/ping`, `/hello`, `/echo`.
 | `help_text.py` | The command list behind `syntia help`, `/help`, and the AI prompt |
 | `System_Prompt.md` | The AI's personality and rules (plain Markdown) |
 | `spotify_login.py` | One-time Spotify login helper |
+| `assistant/` | The optional voice assistant (see above), plus `spikes/` — the experiments it grew from |
 | `tests/` | Offline test suite (see [Running the tests](#running-the-tests)) |
 | `pytest.ini` | Test runner settings |
 | `requirements.txt` | What the bot needs to run |
@@ -202,6 +238,9 @@ OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M   # used if AI_BACKEND=ollama
 SPOTIFY_CLIENT_ID=        # optional — only to lift the track cap on long playlists
 SPOTIFY_CLIENT_SECRET=
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
+VOICE_USER_IDS=           # voice assistant: who may use it (comma-separated IDs)
+PIPER_MODEL=              # voice assistant: Piper .onnx voice (empty = text-only replies)
+STT_DEVICE=cuda           # voice assistant: cuda or cpu
 ```
 
 ## Running the tests

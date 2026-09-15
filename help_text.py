@@ -27,6 +27,7 @@ COMMANDS = {
         ("syntia leave", "Leave the voice channel (aliases: bye, disconnect)"),
         ("syntia join", "Join your voice channel without playing (aliases: come, summon)"),
         ("syntia timeout [on | off | minutes]", "Show or change the idle auto-leave (admins)"),
+        ("syntia assistant [on | off]", "Voice commands: say \"hey jarvis, ...\" (experimental)"),
     ],
     "Other": [
         ("syntia roll [N]", "Roll a die, 1 to N (default 6)"),

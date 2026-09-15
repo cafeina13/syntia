@@ -29,6 +29,7 @@ import discord
 from discord.opus import OPUS_SILENCE
 from dotenv import load_dotenv
 
+from assistant.windows import disable_power_throttling
 from assistant.voice_receive import BYTES_PER_SAMPLE, SAMPLES_PER_FRAME, ListeningVoiceClient, VoiceReceiver
 
 try:
@@ -215,29 +216,6 @@ def chime_pcm() -> bytes:
         fade = np.minimum(1, np.minimum(t, t[::-1]) / 0.01)
         notes.append(3000 * fade * np.sin(2 * np.pi * frequency * t))
     return np.repeat(np.concatenate(notes).astype(np.int16), 2).tobytes()
-
-
-def disable_power_throttling() -> bool:
-    # Windows 11 puts background processes into "efficiency mode" (EcoQoS): slow
-    # efficiency cores, lower speed. A bot whose console isn't the focused window
-    # is exactly that. Opt this process out. Returns True if Windows accepted.
-    if os.name != "nt":
-        return False
-    import ctypes
-    from ctypes import wintypes
-
-    class ThrottlingState(ctypes.Structure):
-        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-    kernel32.SetProcessInformation.restype = wintypes.BOOL
-    PROCESS_POWER_THROTTLING = 4  # ProcessPowerThrottling
-    EXECUTION_SPEED = 0x1  # control execution-speed throttling...
-    state = ThrottlingState(1, EXECUTION_SPEED, 0)  # ...and turn it OFF
-    return bool(kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), PROCESS_POWER_THROTTLING,
-                                               ctypes.byref(state), ctypes.sizeof(state)))
 
 
 def save_command_wav(audio, user_id: int) -> str:
