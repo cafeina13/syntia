@@ -1,0 +1,3 @@
+# Extra packages for the voice assistant (assistant/). The music bot does not need these.
+-r ../requirements.txt
+faster-whisper>=1.1
