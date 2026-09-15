@@ -3,6 +3,9 @@ The AI brain: tool definitions, the Gemini/Ollama backends, and the dispatcher
 that turns a chat message into either a text reply or one-or-more tool calls.
 """
 
+import asyncio
+import time
+
 import discord
 from google.genai import types
 
@@ -265,7 +268,111 @@ GEMINI_TOOLS = _build_gemini_tools()
 OLLAMA_TOOLS = _build_ollama_tools()
 
 
-async def generate_gemini(system: str, prompt: str, audio: bytes | None = None) -> dict:
+# Models that just said "busy" or "quota used up" are skipped for a while:
+# model name -> monotonic time when it's worth trying again.
+_resting_until: dict[str, float] = {}
+QUOTA_REST_SECONDS = 15 * 60  # 429: a daily/minute quota ran out
+OVERLOADED_REST_SECONDS = 60  # 503: Google's servers are overloaded right now
+last_model_used: str | None = None  # which model answered last (handy when debugging)
+
+
+async def _generate_with_fallback(on_switch=None, **request):
+    # Try config.GEMINI_MODELS in order, skipping resting ones. Returns the
+    # response of the first model that answers; re-raises the last busy error
+    # if every model is busy, so ask_ai can say "try again in a minute".
+    # No time limit on purpose: a slow answer beats no answer, and Progress
+    # keeps the wait from feeling dead. `on_switch` is awaited when moving on.
+    global last_model_used
+    now = time.monotonic()
+    models = [m for m in config.GEMINI_MODELS if _resting_until.get(m, 0) <= now] or config.GEMINI_MODELS
+    last_error = None
+    for index, model in enumerate(models):
+        try:
+            response = await config.gemini_client.aio.models.generate_content(model=model, **request)
+        except Exception as error:
+            if not is_busy_error(error):
+                raise  # a real problem (bad request, bad key): don't hide it behind retries
+            rest = QUOTA_REST_SECONDS if ("429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)) \
+                else OVERLOADED_REST_SECONDS
+            _resting_until[model] = time.monotonic() + rest
+            last_error = error
+            if on_switch is not None and index + 1 < len(models):
+                await on_switch()
+            continue
+        last_model_used = model
+        return response
+    raise last_error
+
+
+# --- keeping a slow answer from feeling dead ------------------------------------------
+# Most replies arrive in 1-4 s under "Syntia is typing...". When one takes longer,
+# ONE status message appears and is edited as time passes, then deleted as soon
+# as the real answer lands. (seconds since the question, text)
+PROGRESS_STEPS = [
+    (3, "🍳 Cooking something up…"),
+    (12, "🍳 Still cooking… this one's taking a while"),
+    (30, "🍳 Almost there… the AI is having a slow day"),
+]
+SWITCH_NOTE = " (main AI is busy, asking another one)"
+
+
+class Progress:
+    def __init__(self, channel):
+        self.channel = channel
+        self.message = None  # the status message, once shown
+        self.text = None
+        self.switched = False
+        self._done = asyncio.Event()
+        self._task = None
+
+    def start(self):
+        self._task = asyncio.create_task(self._timeline())
+
+    async def _timeline(self):
+        elapsed = 0.0
+        for at, text in PROGRESS_STEPS:
+            try:
+                # Wait for the next step, or stop early the moment the answer is in.
+                await asyncio.wait_for(self._done.wait(), timeout=at - elapsed)
+                return
+            except asyncio.TimeoutError:
+                elapsed = at
+            await self._show(text)
+
+    async def _show(self, text: str):
+        self.text = text
+        content = text + (SWITCH_NOTE if self.switched else "")
+        try:
+            if self.message is None:
+                self.message = await self.channel.send(content, silent=True)
+                # A spoken request can react too (e.g. say "Bir saniye…" once).
+                hook = getattr(self.channel, "on_ai_progress", None)
+                if hook is not None:
+                    await hook(content)
+            elif hasattr(self.message, "edit"):
+                await self.message.edit(content=content)
+        except Exception:
+            pass  # purely cosmetic: never let a status message break the answer
+
+    async def model_switched(self):
+        self.switched = True
+        if self.message is not None and self.text:
+            await self._show(self.text)
+
+    async def finish(self):
+        # Called when the answer (or an error) is in: stop the timeline without
+        # interrupting a status message mid-send, then remove it.
+        self._done.set()
+        if self._task is not None:
+            await self._task
+        if self.message is not None and hasattr(self.message, "delete"):
+            try:
+                await self.message.delete()
+            except Exception:
+                pass
+
+
+async def generate_gemini(system: str, prompt: str, audio: bytes | None = None, on_switch=None) -> dict:
     # Returns a normalized result so ask_ai doesn't care which backend ran:
     #   {"type": "tools", "calls": [{"name", "args"}, ...]}  or  {"type": "text", "text": ...}
     # A single response may contain SEVERAL tool calls (e.g. "shuffle then skip").
@@ -276,8 +383,8 @@ async def generate_gemini(system: str, prompt: str, audio: bytes | None = None) 
         contents = [types.Part.from_bytes(data=audio, mime_type="audio/wav")]
         if prompt:
             contents.append(types.Part.from_text(text=prompt))
-    response = await config.gemini_client.aio.models.generate_content(
-        model=config.GEMINI_MODEL,
+    response = await _generate_with_fallback(
+        on_switch=on_switch,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system, tools=GEMINI_TOOLS
@@ -395,19 +502,23 @@ async def ask_ai(message: discord.Message, prompt: str, *, audio: bytes | None =
         return {"type": "error", "reason": "not_set_up"}
 
     system = build_system_instruction(message, voice=audio is not None)
+    progress = Progress(message.channel)
+    progress.start()
     try:
         async with message.channel.typing():
-            if audio is None:
-                result = await backend(system, prompt)
+            if backend is generate_gemini:
+                result = await backend(system, prompt, audio=audio, on_switch=progress.model_switched)
             else:
-                result = await backend(system, prompt, audio=audio)
+                result = await backend(system, prompt)
     except Exception as error:
+        await progress.finish()
         # Never let one bad AI call crash the whole bot — report and move on.
         if is_busy_error(error):
             await message.channel.send("The AI is busy right now — try again in a minute.")
             return {"type": "error", "reason": "busy"}
         await message.channel.send(f"AI error: {error}")
         return {"type": "error", "reason": "failed"}
+    await progress.finish()  # status message (if any) goes away before the answer shows
 
     if result["type"] == "tools":
         # Run each requested tool in the order the AI returned them.

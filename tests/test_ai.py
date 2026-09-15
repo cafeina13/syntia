@@ -277,6 +277,180 @@ async def test_other_errors_still_show_the_details(monkeypatch):
     assert result == {"type": "error", "reason": "failed"} and channel.last == "AI error: bad request"
 
 
+# --- model fallback ------------------------------------------------------------------
+
+
+class PerModelGemini:
+    # Each model name answers from its own script: an exception to raise, or a response.
+    def __init__(self, behaviour):
+        self.behaviour, self.tried = behaviour, []
+        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content=self._generate))
+
+    async def _generate(self, model, **kwargs):
+        self.tried.append(model)
+        outcome = self.behaviour[model]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+QUOTA = RuntimeError("429 RESOURCE_EXHAUSTED. GenerateRequestsPerDayPerProjectPerModel-FreeTier")
+OVERLOADED = RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand")
+
+
+@pytest.fixture
+def three_models(monkeypatch):
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "GEMINI_MODELS", ["new-flash", "old-flash", "lite"])
+
+
+async def test_falls_back_to_the_next_model_when_quota_is_used_up(recorded, three_models, monkeypatch):
+    client = PerModelGemini({"new-flash": QUOTA, "old-flash": gemini_says_tool("skip_song", {}), "lite": QUOTA})
+    monkeypatch.setattr(config, "gemini_client", client)
+    result = await ai.ask_ai(make_message(FakeGuild()), "şarkıyı geç")
+    assert client.tried == ["new-flash", "old-flash"]
+    assert result["type"] == "tools" and recorded == [("skip_song", ())]
+    assert ai.last_model_used == "old-flash"
+
+
+async def test_a_resting_model_is_skipped_next_time(three_models, monkeypatch):
+    client = PerModelGemini({"new-flash": QUOTA, "old-flash": gemini_says_tool("skip_song", {}), "lite": QUOTA})
+    monkeypatch.setattr(config, "gemini_client", client)
+    monkeypatch.setattr(music, "skip_song", _noop)
+    await ai.ask_ai(make_message(FakeGuild()), "geç")
+    client.tried.clear()
+    await ai.ask_ai(make_message(FakeGuild()), "geç")
+    assert client.tried == ["old-flash"]  # no wasted request on the model that's out of quota
+
+
+async def test_rest_ends_and_the_preferred_model_is_used_again(three_models, monkeypatch):
+    client = PerModelGemini({"new-flash": OVERLOADED, "old-flash": gemini_says_tool("skip_song", {}), "lite": QUOTA})
+    monkeypatch.setattr(config, "gemini_client", client)
+    monkeypatch.setattr(music, "skip_song", _noop)
+    await ai.ask_ai(make_message(FakeGuild()), "geç")
+    assert ai._resting_until["new-flash"] - ai._resting_until.get("old-flash", 0) > 0
+    ai._resting_until["new-flash"] = 0  # pretend the rest is over
+    client.behaviour["new-flash"] = gemini_says_tool("skip_song", {})
+    client.tried.clear()
+    await ai.ask_ai(make_message(FakeGuild()), "geç")
+    assert client.tried == ["new-flash"]
+
+
+async def test_all_models_busy_means_the_friendly_busy_message(three_models, monkeypatch):
+    client = PerModelGemini({"new-flash": QUOTA, "old-flash": OVERLOADED, "lite": QUOTA})
+    monkeypatch.setattr(config, "gemini_client", client)
+    channel = FakeTextChannel()
+    result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hi")
+    assert client.tried == ["new-flash", "old-flash", "lite"]
+    assert result == {"type": "error", "reason": "busy"} and channel.last.startswith("The AI is busy")
+
+
+async def test_when_every_model_is_resting_they_are_all_tried_anyway(three_models, monkeypatch):
+    import time
+    for model in config.GEMINI_MODELS:
+        ai._resting_until[model] = time.monotonic() + 999
+    client = PerModelGemini({"new-flash": gemini_says_tool("skip_song", {}), "old-flash": QUOTA, "lite": QUOTA})
+    monkeypatch.setattr(config, "gemini_client", client)
+    monkeypatch.setattr(music, "skip_song", _noop)
+    result = await ai.ask_ai(make_message(FakeGuild()), "geç")
+    assert result["type"] == "tools" and client.tried == ["new-flash"]
+
+
+async def test_real_errors_do_not_fall_back(three_models, monkeypatch):
+    client = PerModelGemini({"new-flash": ValueError("400 INVALID_ARGUMENT"), "old-flash": QUOTA, "lite": QUOTA})
+    monkeypatch.setattr(config, "gemini_client", client)
+    channel = FakeTextChannel()
+    result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hi")
+    assert client.tried == ["new-flash"]  # a broken request would break on every model
+    assert result == {"type": "error", "reason": "failed"}
+
+
+async def _noop(*args, **kwargs):
+    return None
+
+
+# --- progress while a slow answer cooks ------------------------------------------------
+
+
+class SlowGemini:
+    # Per model: (seconds to think, response or exception).
+    def __init__(self, behaviour):
+        self.behaviour = behaviour
+        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content=self._generate))
+
+    async def _generate(self, model, **kwargs):
+        import asyncio
+        delay, outcome = self.behaviour[model]
+        await asyncio.sleep(delay)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+@pytest.fixture
+def quick_steps(monkeypatch):
+    # The real timeline is 3 s / 12 s / 30 s; tests use 50 / 150 / 300 ms.
+    monkeypatch.setattr(ai, "PROGRESS_STEPS", [(0.05, "cooking"), (0.15, "still cooking"), (0.3, "almost")])
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "GEMINI_MODELS", ["main", "backup"])
+
+
+async def test_a_fast_answer_shows_no_status(quick_steps, monkeypatch):
+    monkeypatch.setattr(config, "gemini_client", SlowGemini({"main": (0.0, gemini_text("selam!"))}))
+    channel = FakeTextChannel()
+    await ai.ask_ai(make_message(FakeGuild(), channel=channel), "selam")
+    assert channel.sent == ["selam!"] and channel.deleted == []
+
+
+async def test_a_slow_answer_shows_a_status_that_updates_then_disappears(quick_steps, monkeypatch):
+    monkeypatch.setattr(config, "gemini_client", SlowGemini({"main": (0.2, gemini_text("tamam"))}))
+    channel = FakeTextChannel()
+    await ai.ask_ai(make_message(FakeGuild(), channel=channel), "bir şey")
+    assert channel.sent == ["cooking", "tamam"]  # one status message, then the answer
+    assert channel.edits == ["still cooking"]  # edited in place, not a new message
+    assert channel.messages[0].deleted and channel.silent[0] is True  # removed, never pinged anyone
+
+
+async def test_switching_models_is_mentioned_in_the_status(quick_steps, monkeypatch):
+    monkeypatch.setattr(config, "gemini_client", SlowGemini({
+        "main": (0.08, RuntimeError("503 UNAVAILABLE")), "backup": (0.05, gemini_text("geldim")),
+    }))
+    channel = FakeTextChannel()
+    await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hey")
+    assert channel.sent[0] == "cooking"
+    assert channel.edits == ["cooking" + ai.SWITCH_NOTE]
+    assert channel.sent[-1] == "geldim" and channel.messages[0].deleted
+
+
+async def test_status_is_cleaned_up_when_every_model_is_busy(quick_steps, monkeypatch):
+    busy = RuntimeError("429 RESOURCE_EXHAUSTED")
+    monkeypatch.setattr(config, "gemini_client", SlowGemini({"main": (0.08, busy), "backup": (0.02, busy)}))
+    channel = FakeTextChannel()
+    result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hey")
+    assert result["reason"] == "busy" and channel.messages[0].deleted
+    assert channel.last.startswith("The AI is busy")
+
+
+async def test_slow_answer_hook_fires_once_for_a_spoken_request(quick_steps, monkeypatch):
+    from assistant.request import ReplyChannel
+
+    spoken = []
+
+    async def say(status):
+        spoken.append(status)
+
+    monkeypatch.setattr(config, "gemini_client", SlowGemini({"main": (0.2, gemini_text("tamam"))}))
+    text = FakeTextChannel()
+    reply = ReplyChannel(text, on_slow_answer=say)
+    await ai.ask_ai(SimpleNamespace(guild=FakeGuild(), author=make_member(), channel=reply), "", audio=b"wav")
+    assert spoken == ["cooking"]  # once, not again on every edit
+    assert text.sent[-1] == "tamam"
+
+
+def gemini_text(text):
+    return SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=[gemini_part()]))], text=text)
+
+
 async def test_text_reply_is_returned_too(ollama_backend):
     ollama_backend["result"] = {"type": "text", "text": "Merhaba!"}
     channel = FakeTextChannel()

@@ -33,10 +33,17 @@ class ReplyChannel:
     """
 
     def __init__(self, text_channel: discord.abc.Messageable,
-                 on_first_track: Callable[[dict], Awaitable[None]] | None = None):
+                 on_first_track: Callable[[dict], Awaitable[None]] | None = None,
+                 on_slow_answer: Callable[[str], Awaitable[None]] | None = None):
         self.text_channel = text_channel
         self.on_first_track = on_first_track
+        self.on_slow_answer = on_slow_answer  # e.g. say "Bir saniye…" while the AI thinks
         self._announced = False
+
+    async def on_ai_progress(self, status: str):
+        # ai.Progress calls this once, when an answer is slow enough to show a status.
+        if self.on_slow_answer is not None:
+            await self.on_slow_answer(status)
 
     async def send(self, content=None, **kwargs):
         return await self.text_channel.send(content, **kwargs)

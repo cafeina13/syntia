@@ -70,6 +70,9 @@ AI_BACKEND=gemini        # "gemini" (cloud) or "ollama" (local)
 
 - **Gemini** (recommended, simplest): get a free key at
   <https://aistudio.google.com/apikey> and set `GEMINI_API_KEY` in `.env`.
+  The free tier limits requests **per model, per day** (as low as 20/day), so the
+  bot tries several models in order and moves on when one is busy or used up
+  (`GEMINI_MODELS` in `.env` to change the list).
 - **Ollama** (local, no API key): install [Ollama](https://ollama.com), pull a
   tool-capable model (`ollama pull qwen2.5:7b-instruct-q4_K_M`), and set
   `OLLAMA_MODEL` to match. Best as a backup for when Gemini's free tier hits its
@@ -194,6 +197,7 @@ IDLE_TIMEOUT_MINUTES=5    # leave voice after N quiet minutes; 0 = off by defaul
 DEFAULT_VOLUME=100        # starting playback volume in percent (0-100)
 AI_BACKEND=gemini         # "gemini" or "ollama"
 GEMINI_API_KEY=           # needed if AI_BACKEND=gemini
+GEMINI_MODELS=            # optional — models to try in order (each has its own free daily quota)
 OLLAMA_MODEL=qwen2.5:7b-instruct-q4_K_M   # used if AI_BACKEND=ollama
 SPOTIFY_CLIENT_ID=        # optional — only to lift the track cap on long playlists
 SPOTIFY_CLIENT_SECRET=
