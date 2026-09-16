@@ -142,7 +142,7 @@ async def test_ask_ai_reports_backend_errors(monkeypatch):
     monkeypatch.setattr(ai, "generate_ollama", broken)
     channel = FakeTextChannel()
     await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hi")
-    assert channel.last == "AI error: ollama is not running"
+    assert channel.last == "Can't reach Ollama — is it running?"
 
 
 async def test_ask_ai_without_any_backend(monkeypatch):
@@ -269,12 +269,13 @@ async def test_busy_gemini_gets_a_friendly_message(monkeypatch, error):
     assert channel.last == "The AI is busy right now — try again in a minute."
 
 
-async def test_other_errors_still_show_the_details(monkeypatch):
+async def test_other_errors_get_a_short_label(monkeypatch):
     monkeypatch.setattr(config, "AI_BACKEND", "gemini")
     monkeypatch.setattr(config, "gemini_client", CapturingGemini(error=ValueError("bad request")))
     channel = FakeTextChannel()
     result = await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hi")
-    assert result == {"type": "error", "reason": "failed"} and channel.last == "AI error: bad request"
+    assert result == {"type": "error", "reason": "failed"}
+    assert channel.last == "Something went wrong with the AI (ValueError: bad request). Try again?"
 
 
 # --- model fallback ------------------------------------------------------------------
@@ -505,3 +506,70 @@ def test_voice_note_does_not_push_everything_towards_music():
     assert "usually a music command" not in note
     names = [spec["name"] for spec in ai.TOOL_SPECS]
     assert "turn_off_assistant" in names and "turn_on_assistant" in names
+
+
+# --- error classification (regression: raw JSON errors were dumped into chat) ------
+
+
+from google.genai import errors as genai_errors  # noqa: E402
+
+
+def api_error(cls, code, status, message="details " * 80):
+    return cls(code, {"error": {"code": code, "message": message, "status": status}})
+
+
+@pytest.mark.parametrize("error", [
+    api_error(genai_errors.ClientError, 429, "RESOURCE_EXHAUSTED"),
+    api_error(genai_errors.ServerError, 500, "INTERNAL"),
+    api_error(genai_errors.ServerError, 502, "BAD_GATEWAY"),
+    api_error(genai_errors.ServerError, 503, "UNAVAILABLE"),
+    api_error(genai_errors.ServerError, 504, "DEADLINE_EXCEEDED"),
+    TimeoutError("read timed out"),
+    ConnectionError("connection reset"),
+    type("ReadTimeout", (Exception,), {})("httpx read timeout"),
+])
+def test_struggling_service_counts_as_busy(error):
+    assert ai.is_busy_error(error)
+
+
+@pytest.mark.parametrize("error", [
+    api_error(genai_errors.ClientError, 400, "INVALID_ARGUMENT"),
+    api_error(genai_errors.ClientError, 403, "PERMISSION_DENIED"),
+    ValueError("bad request"),
+    ValueError("x" * 80 + " 503 later in the text"),  # a code deep in a message doesn't count
+])
+def test_real_errors_are_not_busy(error):
+    assert not ai.is_busy_error(error)
+
+
+def test_short_error_never_dumps_the_json():
+    error = api_error(genai_errors.ClientError, 400, "INVALID_ARGUMENT")
+    assert len(str(error)) > 500
+    assert ai.short_error(error) == "400 INVALID_ARGUMENT"
+    assert ai.short_error(ValueError("line one\nline two")) == "ValueError: line one"
+    assert ai.short_error(RuntimeError()) == "RuntimeError"
+
+
+@pytest.mark.parametrize("error", [
+    api_error(genai_errors.ServerError, 500, "INTERNAL"),
+    api_error(genai_errors.ServerError, 504, "DEADLINE_EXCEEDED"),
+    api_error(genai_errors.ClientError, 400, "INVALID_ARGUMENT"),
+])
+async def test_chat_only_ever_gets_a_short_line(monkeypatch, error):
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "GEMINI_MODELS", ["only"])
+    monkeypatch.setattr(config, "gemini_client", CapturingGemini(error=error))
+    channel = FakeTextChannel()
+    await ai.ask_ai(make_message(FakeGuild(), channel=channel), "hi")
+    assert len(channel.last) < 100 and "{" not in channel.last
+
+
+async def test_server_errors_move_on_to_the_next_model(recorded, monkeypatch):
+    monkeypatch.setattr(config, "AI_BACKEND", "gemini")
+    monkeypatch.setattr(config, "GEMINI_MODELS", ["main", "backup"])
+    client = PerModelGemini({"main": api_error(genai_errors.ServerError, 500, "INTERNAL"),
+                             "backup": gemini_says_tool("skip_song", {})})
+    monkeypatch.setattr(config, "gemini_client", client)
+    await ai.ask_ai(make_message(FakeGuild()), "geç")
+    assert client.tried == ["main", "backup"] and recorded == [("skip_song", ())]
+    assert ai._resting_until["main"] - ai.time.monotonic() < ai.QUOTA_REST_SECONDS  # short rest, not 15 min

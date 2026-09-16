@@ -93,7 +93,9 @@ def load_models(stt_device: str, piper_model: str | None) -> tuple[Models, list[
             from assistant.tts import Voice
             voice = Voice(piper_model)
         except Exception as error:
-            notes.append(f"Couldn't load the Piper voice ({type(error).__name__}): replies will be text only.")
+            print(f"Piper voice failed to load from {piper_model}: {error!r}")
+            notes.append(f"Couldn't load the Piper voice ({type(error).__name__}: {piper_model}): "
+                         "replies will be text only.")
     else:
         notes.append("No PIPER_MODEL in .env: replies will be text only.")
 
@@ -238,7 +240,9 @@ class AssistantManager:
         if self.owner_id:
             self.permitted.add(self.owner_id)
         self.stt_device = stt_device or os.getenv("STT_DEVICE", "cuda")
-        self.piper_model = piper_model if piper_model is not None else os.getenv("PIPER_MODEL")
+        raw_model = piper_model if piper_model is not None else os.getenv("PIPER_MODEL")
+        # Relative to the project, not to wherever the bot was started from.
+        self.piper_model = str(config.project_path(raw_model)) if raw_model else None
         self.loader = loader
         self.make_receiver = make_receiver
         self.models: Models | None = None
@@ -294,7 +298,9 @@ class AssistantManager:
                 try:
                     self.models, notes = await asyncio.to_thread(self.loader, self.stt_device, self.piper_model)
                 except Exception as error:
-                    await message.channel.send(f"Couldn't start the voice assistant: {error}")
+                    print(f"Voice assistant failed to start: {error!r}")
+                    await message.channel.send(
+                        f"Couldn't start the voice assistant ({ai.short_error(error)}).")
                     return
         session = VoiceSession(self, guild, message.channel, voice, self.models)
         self.sessions[guild.id] = session

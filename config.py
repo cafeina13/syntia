@@ -5,6 +5,7 @@ Loads secrets from .env and creates the AI / Spotify clients once, so the rest
 of the code can just `import config` and use them. No Discord logic lives here.
 """
 
+import logging
 import os
 from pathlib import Path
 
@@ -12,11 +13,25 @@ import ollama
 import spotipy
 from dotenv import load_dotenv
 from google import genai
-from spotipy.oauth2 import SpotifyOAuth
+from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
+
+# The folder this file lives in. Relative paths from .env (e.g. PIPER_MODEL) are
+# resolved against it, so the bot works no matter which folder it's started from.
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def project_path(value: str | None) -> Path | None:
+    # "models\voice.onnx" -> <project>/models/voice.onnx; absolute paths stay as-is.
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
 
 # Load secrets from the .env file into the environment. We keep them OUT of the
-# code so they never get committed to git.
-load_dotenv()
+# code so they never get committed to git. (Always THIS project's .env, even when
+# the bot is started from another folder.)
+load_dotenv(PROJECT_ROOT / ".env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Optional: the ID of YOUR server, for instant slash-command updates in dev.
@@ -74,11 +89,25 @@ SPOTIFY_REDIRECT_URI = os.getenv(
     "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"
 )
 SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
-SPOTIFY_CACHE = str(Path(__file__).parent / ".spotify_cache")
+SPOTIFY_CACHE = str(PROJECT_ROOT / ".spotify_cache")
+
+class BotSpotifyOAuth(SpotifyOAuth):
+    # If the saved login can't be refreshed, spotipy's default is to ASK for a new
+    # one on the console with input() — and wait there forever, freezing that
+    # command. A bot must fail instead; music.py then falls back to Spotify's
+    # public page. (Fix: run spotify_login.py again.)
+    def get_auth_response(self, open_browser=None):
+        raise SpotifyOauthError("Spotify login expired or revoked; run spotify_login.py again.")
+
+
+# spotipy logs every failed request as an ERROR, even ones we expect and handle
+# (someone else's playlist -> 403/404 -> public page fallback). That looked like a
+# crash in the console, so only real trouble gets through.
+logging.getLogger("spotipy.client").setLevel(logging.CRITICAL)
 
 spotify_client = None
 if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
-    spotify_auth = SpotifyOAuth(
+    spotify_auth = BotSpotifyOAuth(
         client_id=SPOTIFY_CLIENT_ID,
         client_secret=SPOTIFY_CLIENT_SECRET,
         redirect_uri=SPOTIFY_REDIRECT_URI,
@@ -88,13 +117,20 @@ if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
     )
     # Only enable Spotify if a login is already cached (from spotify_login.py).
     if spotify_auth.cache_handler.get_cached_token():
-        spotify_client = spotipy.Spotify(auth_manager=spotify_auth)
+        spotify_client = spotipy.Spotify(
+            auth_manager=spotify_auth,
+            requests_timeout=10,
+            # Never wait out a rate limit: Spotify's Retry-After can be HOURS, and
+            # spotipy would sleep through it. Fail fast and use the public page.
+            status_retries=0,
+            retries=1,
+        )
 
 # The bot's "system prompt" (personality + rules) lives in System_Prompt.md so
 # you can edit the personality in plain Markdown without touching code.
 # NOTE: encoding="utf-8" is required — without it, Windows may fail on characters
 # like the em dash.
-PROMPT_FILE = Path(__file__).parent / "System_Prompt.md"
+PROMPT_FILE = PROJECT_ROOT / "System_Prompt.md"
 try:
     AI_PRE_PROMPT = PROMPT_FILE.read_text(encoding="utf-8").strip()
 except FileNotFoundError:
