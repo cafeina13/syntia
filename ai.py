@@ -318,8 +318,8 @@ async def _generate_with_fallback(on_switch=None, **request):
         except Exception as error:
             if not is_busy_error(error):
                 raise  # a real problem (bad request, bad key): don't hide it behind retries
-            rest = QUOTA_REST_SECONDS if ("429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)) \
-                else OVERLOADED_REST_SECONDS
+            rest = QUOTA_REST_SECONDS if is_quota_error(error) else OVERLOADED_REST_SECONDS
+            print(f"AI: {model} is busy ({short_error(error)}), trying the next model")
             _resting_until[model] = time.monotonic() + rest
             last_error = error
             if on_switch is not None and index + 1 < len(models):
@@ -509,11 +509,43 @@ async def run_tool(message: discord.Message, name: str, args: dict):
         await message.channel.send(help_message())
 
 
+# Status codes / names that mean "the service is struggling right now", not "your
+# request is wrong": out of quota (429), internal error (500), bad gateway (502),
+# overloaded (503), timed out (504). Worth another model and a friendly "try again".
+BUSY_CODES = {429, 500, 502, 503, 504}
+BUSY_NAMES = ("RESOURCE_EXHAUSTED", "INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED")
+
+
+def error_code(error: Exception) -> int | None:
+    # google-genai's APIError carries the HTTP status as .code.
+    code = getattr(error, "code", None)
+    return code if isinstance(code, int) else None
+
+
 def is_busy_error(error: Exception) -> bool:
-    # Gemini's free tier answers "too many requests" (429) or "overloaded" (503)
-    # at busy moments. Those are worth a friendly "try again", not a stack dump.
-    text = str(error)
-    return any(marker in text for marker in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE"))
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True  # the network, not the request
+    if error_code(error) in BUSY_CODES or getattr(error, "status", None) in BUSY_NAMES:
+        return True
+    name = type(error).__name__
+    if "Timeout" in name or "ConnectError" in name:  # httpx's timeout / connection errors
+        return True
+    head = str(error)[:60]  # the code and status name lead the message
+    return any(marker in head for marker in [str(code) for code in BUSY_CODES] + list(BUSY_NAMES))
+
+
+def is_quota_error(error: Exception) -> bool:
+    return error_code(error) == 429 or "RESOURCE_EXHAUSTED" in str(error)[:60]
+
+
+def short_error(error: Exception) -> str:
+    # A one-line label for chat, e.g. "400 INVALID_ARGUMENT". The full error (which
+    # can be a screenful of JSON) goes to the console, never into the channel.
+    code, status = error_code(error), getattr(error, "status", None)
+    if code is not None:
+        return f"{code} {status or ''}".strip()
+    first_line = (str(error).strip().splitlines() or [""])[0]
+    return f"{type(error).__name__}: {first_line[:120]}" if first_line else type(error).__name__
 
 
 async def ask_ai(message: discord.Message, prompt: str, *, audio: bytes | None = None) -> dict:
@@ -554,10 +586,14 @@ async def ask_ai(message: discord.Message, prompt: str, *, audio: bytes | None =
     except Exception as error:
         await progress.finish()
         # Never let one bad AI call crash the whole bot — report and move on.
+        print(f"AI request failed: {error!r}")  # the full details, for whoever runs the bot
+        if backend is generate_ollama and isinstance(error, ConnectionError):
+            await message.channel.send("Can't reach Ollama — is it running?")
+            return {"type": "error", "reason": "failed"}
         if is_busy_error(error):
             await message.channel.send("The AI is busy right now — try again in a minute.")
             return {"type": "error", "reason": "busy"}
-        await message.channel.send(f"AI error: {error}")
+        await message.channel.send(f"Something went wrong with the AI ({short_error(error)}). Try again?")
         return {"type": "error", "reason": "failed"}
     await progress.finish()  # status message (if any) goes away before the answer shows
     # A spoken request can react as soon as the AI has decided, before tools run

@@ -27,8 +27,7 @@ from pathlib import Path
 
 import discord
 from discord.opus import OPUS_SILENCE
-from dotenv import load_dotenv
-
+import config  # loads the project's .env and resolves paths in it
 from assistant.windows import disable_power_throttling
 from assistant.voice_receive import BYTES_PER_SAMPLE, SAMPLES_PER_FRAME, ListeningVoiceClient, VoiceReceiver
 
@@ -48,14 +47,13 @@ try:
 except ImportError:  # assistant/requirements.txt not installed: `spike listen` explains
     WakeModel = None
 
-load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PERMITTED = {int(x) for x in os.getenv("VOICE_USER_IDS", "").replace(" ", "").split(",") if x}
 PREFIX = "spike "
 OUT_DIR = Path(__file__).resolve().parent.parent.parent / "recordings"
 MAX_SECONDS = 300  # per user, so a forgotten recording can't eat all the RAM
 MAX_GAP_SECONDS = 1.0  # longer silences get squashed to this in the WAV
-PIPER_MODEL = os.getenv("PIPER_MODEL")
+PIPER_MODEL = str(config.project_path(os.getenv("PIPER_MODEL"))) if os.getenv("PIPER_MODEL") else None
 STT_DEVICE = os.getenv("STT_DEVICE", "cuda")  # "cpu" keeps the GPU free (~3 s per command)
 _voice = None  # loaded on first `spike say`
 

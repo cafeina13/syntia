@@ -83,6 +83,15 @@ MAX_RESUME_ATTEMPTS = 3
 players: dict[int, GuildPlayer] = {}
 
 
+def short_error(error: Exception) -> str:
+    # yt-dlp and Spotify errors can be many lines long; chat gets the first line,
+    # trimmed, and the console gets the whole thing.
+    print(f"music: {error!r}")
+    first_line = (str(error).strip().splitlines() or [type(error).__name__])[0]
+    first_line = first_line.removeprefix("ERROR: ")
+    return first_line if len(first_line) <= 150 else first_line[:147] + "..."
+
+
 def get_player(guild_id: int) -> GuildPlayer:
     # setdefault: return the existing player, or create one on first use.
     return players.setdefault(guild_id, GuildPlayer())
@@ -124,7 +133,7 @@ async def _start_track(guild: discord.Guild, entry: dict, offset: int, announce:
         info = await resolve_stream(entry["query"])
     except Exception as error:
         await entry["channel"].send(
-            f"Skipping **{entry['title']}** (couldn't load it: {error})."
+            f"Skipping **{entry['title']}** (couldn't load it: {short_error(error)})."
         )
         return False
     title = info["title"]
@@ -285,8 +294,12 @@ def spotify_tracks(url: str) -> list:
     if config.spotify_client is not None:
         try:
             return _spotify_tracks_api(kind, spotify_id)
-        except Exception:
-            pass  # e.g. someone else's playlist (403) -> fall back to scraping
+        except Exception as error:
+            # e.g. someone else's playlist (403/404), a rate limit, or an expired
+            # login: all fine, the public page usually still has the tracks.
+            print(f"Spotify API couldn't read {kind} {spotify_id} "
+                  f"({type(error).__name__}: {str(error).strip().splitlines()[0][:100]}); "
+                  "using the public page instead")
     return _scrape_spotify(kind, spotify_id)
 
 
@@ -345,6 +358,9 @@ def _scrape_spotify(kind: str, spotify_id: str) -> list:
         if query:
             searches.append(query)
     return searches
+
+
+SPOTIFY_TIMEOUT_SECONDS = 45  # the API (10 s) plus the public-page fallback (20 s), with room
 
 
 def is_spotify_url(text: str) -> bool:
@@ -422,7 +438,7 @@ async def join_voice(message: discord.Message):
     try:
         voice = await ensure_voice(message)
     except Exception as error:
-        await message.channel.send(f"Couldn't join **{channel.name}**: {error}")
+        await message.channel.send(f"Couldn't join **{channel.name}**: {short_error(error)}")
         return
     # Remember where we are, so the idle timeout knows where to say goodbye.
     player = get_player(message.guild.id)
@@ -484,9 +500,14 @@ async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
     if is_spotify_url(query):
         async with message.channel.typing():
             try:
-                searches = await asyncio.to_thread(spotify_tracks, query)
+                # A time limit, so a stuck request can never freeze the command.
+                searches = await asyncio.wait_for(asyncio.to_thread(spotify_tracks, query),
+                                                  timeout=SPOTIFY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                await message.channel.send("Spotify took too long to answer — try again in a bit.")
+                return 0
             except Exception as error:
-                await message.channel.send(f"Couldn't read that Spotify link: {error}")
+                await message.channel.send(f"Couldn't read that Spotify link: {short_error(error)}")
                 return 0
         if not searches:
             await message.channel.send("Couldn't get any tracks from that Spotify link.")
@@ -502,7 +523,7 @@ async def enqueue(message: discord.Message, query: str, start_seconds: int = 0,
             try:
                 entries = await asyncio.to_thread(youtube_playlist_entries, query)
             except Exception as error:
-                await message.channel.send(f"Couldn't read that playlist: {error}")
+                await message.channel.send(f"Couldn't read that playlist: {short_error(error)}")
                 return 0
         if not entries:
             await message.channel.send("That playlist had no playable videos.")

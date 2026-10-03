@@ -124,7 +124,8 @@ async def test_on_loads_models_once_joins_and_listens(rig, guild):
     await rig.manager.command(rig.message, "on")
     session = rig.manager.sessions[guild.id]
     try:
-        assert rig.loads == [("cuda", "voice.onnx")]
+        # A relative PIPER_MODEL is resolved against the project, not the current folder.
+        assert rig.loads == [("cuda", str(config.PROJECT_ROOT / "voice.onnx"))]
         assert guild.voice_client is not None  # joined the speaker's channel
         [receiver] = FakeReceiver.instances
         assert receiver.started and receiver.users == {USER}
@@ -317,3 +318,18 @@ async def test_saying_assistant_off_really_turns_it_off(listening, guild):
     assert not listening.manager.sessions and listening.manager.models is None and receiver.stopped
     assert listening.text.last == "🎙️ Voice assistant off."
     assert guild.voice_client is not None  # still in the channel, music untouched
+
+
+def test_piper_path_is_found_from_any_folder(tmp_path, monkeypatch):
+    # Regression (live): started from another folder, "models\...onnx" wasn't found.
+    monkeypatch.chdir(tmp_path)
+    manager = ss.AssistantManager(permitted={1}, owner_id=0, piper_model="models/step_15000/voice.onnx",
+                                  loader=lambda *a: None, make_receiver=FakeReceiver)
+    assert manager.piper_model == str(config.PROJECT_ROOT / "models" / "step_15000" / "voice.onnx")
+    absolute = str(tmp_path / "voice.onnx")
+    manager = ss.AssistantManager(permitted={1}, owner_id=0, piper_model=absolute,
+                                  loader=lambda *a: None, make_receiver=FakeReceiver)
+    assert manager.piper_model == absolute
+    manager = ss.AssistantManager(permitted={1}, owner_id=0, piper_model="",
+                                  loader=lambda *a: None, make_receiver=FakeReceiver)
+    assert manager.piper_model is None
